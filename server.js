@@ -114,6 +114,75 @@ app.get('/test-hours', (req, res) => {
   });
 });
 
+// Voicemail dashboard
+app.get('/voicemails', async (req, res) => {
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+    return res.status(500).send('Twilio credentials not configured');
+  }
+
+  try {
+    const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    
+    // Get recordings from the last 30 days
+    const recordings = await client.recordings.list({
+      limit: 50,
+      dateCreatedAfter: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+    });
+
+    let html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Voicemails - Business Phone System</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            .voicemail { border: 1px solid #ccc; margin: 10px 0; padding: 15px; border-radius: 5px; }
+            .date { color: #666; font-size: 0.9em; }
+            .duration { font-weight: bold; color: #333; }
+            audio { width: 100%; margin: 10px 0; }
+            .no-recordings { text-align: center; color: #666; padding: 40px; }
+        </style>
+    </head>
+    <body>
+        <h1>📞 Business Voicemails</h1>
+        <p>Total recordings: ${recordings.length}</p>
+    `;
+
+    if (recordings.length === 0) {
+      html += '<div class="no-recordings">No voicemails found in the last 30 days.</div>';
+    } else {
+      recordings.forEach((recording, index) => {
+        const recordingUrl = `https://api.twilio.com${recording.uri.replace('.json', '.mp3')}`;
+        const authenticatedUrl = recordingUrl.replace('https://', `https://${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}@`);
+        
+        html += `
+          <div class="voicemail">
+            <div class="date">📅 ${recording.dateCreated.toLocaleString()}</div>
+            <div class="duration">⏱️ Duration: ${recording.duration} seconds</div>
+            <div>📞 Call SID: ${recording.callSid}</div>
+            <audio controls>
+              <source src="${authenticatedUrl}" type="audio/mpeg">
+              Your browser does not support the audio element.
+            </audio>
+            <div><a href="${authenticatedUrl}" target="_blank">Download Recording</a></div>
+          </div>
+        `;
+      });
+    }
+
+    html += `
+        <hr>
+        <p><a href="/">← Back to Home</a> | <a href="/test-hours">Test Business Hours</a></p>
+    </body>
+    </html>`;
+
+    res.send(html);
+  } catch (error) {
+    console.error('Error fetching recordings:', error);
+    res.status(500).send(`Error fetching voicemails: ${error.message}`);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Webhook URL will be: https://your-app.railway.app/webhook/voice`);
