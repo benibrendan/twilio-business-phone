@@ -2,6 +2,15 @@ require('dotenv').config();
 const express = require('express');
 const { twiml } = require('twilio');
 
+// Temporary hardcoded credentials (REMOVE after testing)
+// Replace with your actual values
+if (!process.env.TWILIO_ACCOUNT_SID) {
+  process.env.TWILIO_ACCOUNT_SID = 'YOUR_ACCOUNT_SID_HERE';
+}
+if (!process.env.TWILIO_AUTH_TOKEN) {
+  process.env.TWILIO_AUTH_TOKEN = 'YOUR_AUTH_TOKEN_HERE';
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -55,7 +64,7 @@ app.post('/webhook/voice', (req, res) => {
     
   } else {
     // After hours: Straight to voicemail
-    response.say('Thank you for calling. Our office hours are Monday through Friday, 8 AM to 5 PM Eastern Time. Please leave a message after the beep.');
+    response.say('Thank you for calling All Cape Fence. Our office hours are Monday through Friday, 8 AM to 5 PM Eastern Time. Please leave a message after the beep.');
     
     response.record({
       action: '/webhook/recording',
@@ -168,9 +177,21 @@ app.get('/voicemails', async (req, res) => {
         const recordingUrl = `https://api.twilio.com${recording.uri.replace('.json', '.mp3')}`;
         const authenticatedUrl = recordingUrl.replace('https://', `https://${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}@`);
         
+        // Convert to EST timezone
+        const estDate = new Date(recording.dateCreated).toLocaleString("en-US", {
+          timeZone: "America/New_York",
+          weekday: 'short',
+          year: 'numeric',
+          month: 'short',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true
+        });
+        
         html += `
           <div class="voicemail">
-            <div class="date">📅 ${recording.dateCreated.toLocaleString()}</div>
+            <div class="date">📅 ${estDate} EST</div>
             <div class="duration">⏱️ Duration: ${recording.duration} seconds</div>
             <div>📞 Call SID: ${recording.callSid}</div>
             <audio controls>
