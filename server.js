@@ -114,10 +114,23 @@ app.get('/test-hours', (req, res) => {
   });
 });
 
+// Debug endpoint to check environment variables
+app.get('/debug-env', (req, res) => {
+  res.json({
+    hasTwilioSid: !!process.env.TWILIO_ACCOUNT_SID,
+    hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
+    sidPrefix: process.env.TWILIO_ACCOUNT_SID ? process.env.TWILIO_ACCOUNT_SID.substring(0, 5) + '...' : 'undefined',
+    nodeEnv: process.env.NODE_ENV || 'undefined'
+  });
+});
+
 // Voicemail dashboard
 app.get('/voicemails', async (req, res) => {
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
-    return res.status(500).send('Twilio credentials not configured');
+    return res.status(500).send(`Twilio credentials not configured. 
+    TWILIO_ACCOUNT_SID exists: ${!!process.env.TWILIO_ACCOUNT_SID}
+    TWILIO_AUTH_TOKEN exists: ${!!process.env.TWILIO_AUTH_TOKEN}
+    Check /debug-env for more details.`);
   }
 
   try {
