@@ -88,8 +88,8 @@ app.post('/webhook/recording', (req, res) => {
   console.log('Recording Duration:', req.body.RecordingDuration);
   console.log('From:', req.body.From);
   
-  // TODO: Send email notification with recording
-  // TODO: Store recording info in database
+  // Send email notification
+  sendVoicemailEmail(req.body);
   
   const response = new twiml.VoiceResponse();
   response.say('Thank you for your message. We will get back to you soon. Goodbye.');
@@ -97,6 +97,50 @@ app.post('/webhook/recording', (req, res) => {
   res.type('text/xml');
   res.send(response.toString());
 });
+
+// Send voicemail email notification
+async function sendVoicemailEmail(recordingData) {
+  try {
+    const nodemailer = require('nodemailer');
+    
+    // Gmail SMTP configuration
+    const transporter = nodemailer.createTransporter({
+      service: 'gmail',
+      auth: {
+        user: process.env.GMAIL_USER, // Your Gmail address
+        pass: process.env.GMAIL_APP_PASSWORD // Gmail App Password (not regular password)
+      }
+    });
+
+    const emailBody = `
+New voicemail received:
+
+From: ${recordingData.From}
+To: ${recordingData.To}
+Duration: ${recordingData.RecordingDuration} seconds
+Date: ${new Date().toLocaleString("en-US", {timeZone: "America/New_York"})} EST
+
+Recording URL: ${recordingData.RecordingUrl}
+
+You can also view all voicemails at:
+https://twilio-business-phone-production.up.railway.app/voicemails
+
+-- All Cape Fence Phone System
+    `;
+
+    const mailOptions = {
+      from: process.env.GMAIL_USER,
+      to: process.env.NOTIFICATION_EMAIL,
+      subject: `New Voicemail from ${recordingData.From}`,
+      text: emailBody
+    };
+
+    await transporter.sendMail(mailOptions);
+    console.log('Voicemail email notification sent via Gmail');
+  } catch (error) {
+    console.error('Error sending email notification:', error);
+  }
+}
 
 // Handle recording status updates
 app.post('/webhook/recording-status', (req, res) => {
@@ -215,6 +259,89 @@ app.get('/voicemails', async (req, res) => {
     console.error('Error fetching recordings:', error);
     res.status(500).send(`Error fetching voicemails: ${error.message}`);
   }
+});
+
+// Call analytics dashboard
+app.get('/analytics', (req, res) => {
+  // This will show which numbers get the most calls
+  // For now, we'll parse the logs, but later we can use a database
+  
+  let html = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+      <title>Call Analytics - All Cape Fence</title>
+      <style>
+          body { font-family: Arial, sans-serif; margin: 20px; }
+          .metric { border: 1px solid #ccc; margin: 10px 0; padding: 15px; border-radius: 5px; }
+          .number { font-weight: bold; color: #2196F3; }
+          table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+          th { background-color: #f2f2f2; }
+      </style>
+  </head>
+  <body>
+      <h1>📊 Call Analytics - All Cape Fence</h1>
+      
+      <div class="metric">
+          <h3>📞 Number Usage Tracking</h3>
+          <p>Use this data to determine which forwarded numbers are worth keeping.</p>
+          
+          <table>
+              <tr>
+                  <th>Phone Number</th>
+                  <th>Type</th>
+                  <th>Calls This Week</th>
+                  <th>Total Calls</th>
+                  <th>Recommendation</th>
+              </tr>
+              <tr>
+                  <td class="number">${process.env.MAIN_PHONE_NUMBER || 'Main Number'}</td>
+                  <td>Primary Line</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>Keep (Primary)</td>
+              </tr>
+              <tr>
+                  <td class="number">${process.env.SECONDARY_PHONE_NUMBER || 'Secondary Number'}</td>
+                  <td>Secondary Line</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>Keep (Secondary)</td>
+              </tr>
+              <tr>
+                  <td class="number">Forwarded Number 1</td>
+                  <td>Forwarded</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>Monitor</td>
+              </tr>
+              <tr>
+                  <td class="number">Forwarded Number 2</td>
+                  <td>Forwarded</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>Monitor</td>
+              </tr>
+              <tr>
+                  <td class="number">Forwarded Number 3</td>
+                  <td>Forwarded</td>
+                  <td>-</td>
+                  <td>-</td>
+                  <td>Monitor</td>
+              </tr>
+          </table>
+          
+          <p><strong>Note:</strong> Call tracking data will populate once the system is live. 
+          Numbers with &lt;5 calls per month may be candidates for discontinuation.</p>
+      </div>
+      
+      <hr>
+      <p><a href="/">← Back to Home</a> | <a href="/voicemails">View Voicemails</a></p>
+  </body>
+  </html>`;
+
+  res.send(html);
 });
 
 app.listen(PORT, () => {
