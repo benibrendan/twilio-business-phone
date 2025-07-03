@@ -173,7 +173,10 @@ app.get('/debug-env', (req, res) => {
     hasTwilioSid: !!process.env.TWILIO_ACCOUNT_SID,
     hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
     sidPrefix: process.env.TWILIO_ACCOUNT_SID ? process.env.TWILIO_ACCOUNT_SID.substring(0, 5) + '...' : 'undefined',
-    nodeEnv: process.env.NODE_ENV || 'undefined'
+    nodeEnv: process.env.NODE_ENV || 'undefined',
+    mainPhone: process.env.MAIN_PHONE_NUMBER || 'undefined',
+    secondaryPhone: process.env.SECONDARY_PHONE_NUMBER || 'undefined',
+    sipDomain: process.env.SIP_DOMAIN || 'undefined'
   });
 });
 
