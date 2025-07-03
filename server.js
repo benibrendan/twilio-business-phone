@@ -104,7 +104,7 @@ async function sendVoicemailEmail(recordingData) {
     const nodemailer = require('nodemailer');
     
     // Gmail SMTP configuration
-    const transporter = nodemailer.createTransporter({
+    const transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: {
         user: process.env.GMAIL_USER, // Your Gmail address
