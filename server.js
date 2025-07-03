@@ -11,6 +11,17 @@ if (!process.env.TWILIO_AUTH_TOKEN) {
   process.env.TWILIO_AUTH_TOKEN = 'YOUR_AUTH_TOKEN_HERE';
 }
 
+// Add the phone numbers temporarily
+if (!process.env.MAIN_PHONE_NUMBER) {
+  process.env.MAIN_PHONE_NUMBER = '+15083942422';
+}
+if (!process.env.SECONDARY_PHONE_NUMBER) {
+  process.env.SECONDARY_PHONE_NUMBER = '+15083943024';
+}
+if (!process.env.SIP_DOMAIN) {
+  process.env.SIP_DOMAIN = 'allcapefence.sip.twilio.com';
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
