@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { twiml } = require('twilio');
+const nodemailer = require('nodemailer');
 
 // Temporary hardcoded credentials (REMOVE after testing)
 // Replace with your actual values
@@ -20,6 +21,11 @@ if (!process.env.SECONDARY_PHONE_NUMBER) {
 }
 if (!process.env.SIP_DOMAIN) {
   process.env.SIP_DOMAIN = 'allcapefence.sip.twilio.com';
+}
+
+// Set mobile phone number
+if (!process.env.MOBILE_PHONE_NUMBER) {
+  process.env.MOBILE_PHONE_NUMBER = '+16174139699';
 }
 
 const app = express();
@@ -55,23 +61,22 @@ app.post('/webhook/voice', (req, res) => {
   const isBusinessHours = (day >= 1 && day <= 5) && (hour >= 8 && hour < 17);
   
   if (isBusinessHours) {
-    // Business hours: Ring for 20 seconds, then voicemail
-    response.say('Thank you for calling. Please hold while we connect you.');
+    // Business hours: Ring desk phone and mobile phone simultaneously for 20 seconds
+    response.say('Thank you for calling All Cape Fence. Please hold while we connect you.');
     
-    // TODO: In Phase 1, we'll add desk phone ringing here
-    // For now, just go to voicemail after a brief pause
-    response.pause({ length: 3 });
-    response.say('We are currently with other customers. Please leave a message after the beep.');
-    
-    response.record({
-      action: '/webhook/recording',
+    // Dial both desk phone and mobile phone simultaneously
+    const dial = response.dial({
+      action: '/webhook/dial-status',
       method: 'POST',
-      maxLength: 120, // 2 minutes max
-      finishOnKey: '#',
-      recordingStatusCallback: '/webhook/recording-status'
+      timeout: 20,
+      callerId: req.body.To // Use the Twilio number as caller ID
     });
     
-    response.say('We did not receive a recording. Goodbye.');
+    // Ring the T33G desk phone via SIP
+    dial.sip('phone1@allcapefence.sip.umatilla.twilio.com');
+    
+    // Also ring mobile phone simultaneously
+    dial.number(process.env.MOBILE_PHONE_NUMBER);
     
   } else {
     // After hours: Straight to voicemail
@@ -86,6 +91,35 @@ app.post('/webhook/voice', (req, res) => {
     });
     
     response.say('We did not receive a recording. Goodbye.');
+  }
+  
+  res.type('text/xml');
+  res.send(response.toString());
+});
+
+// Handle dial status (when mobile phone doesn't answer)
+app.post('/webhook/dial-status', (req, res) => {
+  console.log('Dial status:', req.body.DialCallStatus);
+  console.log('Dial duration:', req.body.DialCallDuration);
+  
+  const response = new twiml.VoiceResponse();
+  
+  // If the call wasn't answered, go to voicemail
+  if (req.body.DialCallStatus === 'no-answer' || req.body.DialCallStatus === 'busy' || req.body.DialCallStatus === 'failed') {
+    response.say('We are currently with other customers. Please leave a message after the beep.');
+    
+    response.record({
+      action: '/webhook/recording',
+      method: 'POST',
+      maxLength: 120,
+      finishOnKey: '#',
+      recordingStatusCallback: '/webhook/recording-status'
+    });
+    
+    response.say('We did not receive a recording. Goodbye.');
+  } else {
+    // Call was answered, no further action needed
+    response.hangup();
   }
   
   res.type('text/xml');
@@ -112,10 +146,19 @@ app.post('/webhook/recording', (req, res) => {
 // Send voicemail email notification
 async function sendVoicemailEmail(recordingData) {
   try {
-    const nodemailer = require('nodemailer');
+    // Check if Gmail credentials are configured
+    if (!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD) {
+      console.error('Gmail credentials not configured. Please set GMAIL_USER and GMAIL_APP_PASSWORD environment variables.');
+      return;
+    }
+    
+    if (!process.env.NOTIFICATION_EMAIL) {
+      console.error('NOTIFICATION_EMAIL not configured. Please set this environment variable.');
+      return;
+    }
     
     // Gmail SMTP configuration
-    const transporter = nodemailer.createTransport({
+    const transporter = nodemailer.createTransporter({
       service: 'gmail',
       auth: {
         user: process.env.GMAIL_USER, // Your Gmail address
@@ -174,7 +217,8 @@ app.get('/test-hours', (req, res) => {
     hour: hour,
     day: day,
     dayName: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day],
-    isBusinessHours: isBusinessHours
+    isBusinessHours: isBusinessHours,
+    mobileNumber: process.env.MOBILE_PHONE_NUMBER || 'Not set'
   });
 });
 
@@ -187,7 +231,11 @@ app.get('/debug-env', (req, res) => {
     nodeEnv: process.env.NODE_ENV || 'undefined',
     mainPhone: process.env.MAIN_PHONE_NUMBER || 'undefined',
     secondaryPhone: process.env.SECONDARY_PHONE_NUMBER || 'undefined',
-    sipDomain: process.env.SIP_DOMAIN || 'undefined'
+    sipDomain: process.env.SIP_DOMAIN || 'undefined',
+    mobilePhone: process.env.MOBILE_PHONE_NUMBER || 'undefined',
+    hasGmailUser: !!process.env.GMAIL_USER,
+    hasGmailPassword: !!process.env.GMAIL_APP_PASSWORD,
+    hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL
   });
 });
 
@@ -360,5 +408,6 @@ app.get('/analytics', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Webhook URL will be: https://your-app.railway.app/webhook/voice`);
+  console.log(`Webhook URL: https://twilio-business-phone-production.up.railway.app/webhook/voice`);
+  console.log(`Mobile forwarding to: ${process.env.MOBILE_PHONE_NUMBER || 'NOT SET'}`);
 });
