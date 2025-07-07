@@ -61,10 +61,10 @@ app.post('/webhook/voice', (req, res) => {
   const isBusinessHours = (day >= 1 && day <= 5) && (hour >= 8 && hour < 17);
   
   if (isBusinessHours) {
-    // Business hours: Ring desk phone and mobile phone simultaneously for 20 seconds
+    // Business hours: Ring desk phone for 20 seconds, then voicemail
     response.say('Thank you for calling All Cape Fence. Please hold while we connect you.');
     
-    // Dial both desk phone and mobile phone simultaneously
+    // Dial the T33G desk phone
     const dial = response.dial({
       action: '/webhook/dial-status',
       method: 'POST',
@@ -74,9 +74,6 @@ app.post('/webhook/voice', (req, res) => {
     
     // Ring the T33G desk phone via SIP
     dial.sip('phone1@allcapefence.sip.twilio.com');
-    
-    // Also ring mobile phone simultaneously
-    dial.number(process.env.MOBILE_PHONE_NUMBER);
     
   } else {
     // After hours: Straight to voicemail
@@ -97,7 +94,7 @@ app.post('/webhook/voice', (req, res) => {
   res.send(response.toString());
 });
 
-// Handle dial status (when mobile phone doesn't answer)
+// Handle dial status (when desk phone doesn't answer)
 app.post('/webhook/dial-status', (req, res) => {
   console.log('Dial status:', req.body.DialCallStatus);
   console.log('Dial duration:', req.body.DialCallDuration);
@@ -121,6 +118,53 @@ app.post('/webhook/dial-status', (req, res) => {
     // Call was answered, no further action needed
     response.hangup();
   }
+  
+  res.type('text/xml');
+  res.send(response.toString());
+});
+
+// Handle outbound calls from desk phone
+app.post('/webhook/outbound', (req, res) => {
+  console.log('Outbound call from SIP phone:');
+  console.log('From:', req.body.From);
+  console.log('To:', req.body.To);
+  console.log('Call SID:', req.body.CallSid);
+  
+  const response = new twiml.VoiceResponse();
+  
+  // Extract the destination number (remove sip: prefix if present)
+  let destinationNumber = req.body.To;
+  if (destinationNumber.startsWith('sip:')) {
+    // Extract number from SIP URI (e.g., sip:+15551234567@... -> +15551234567)
+    destinationNumber = destinationNumber.split('@')[0].replace('sip:', '');
+  }
+  
+  // Validate the number format (should start with + for international format)
+  if (!destinationNumber.startsWith('+')) {
+    // If it's a 10-digit US number, add +1
+    if (destinationNumber.match(/^\d{10}$/)) {
+      destinationNumber = '+1' + destinationNumber;
+    } else if (destinationNumber.match(/^1\d{10}$/)) {
+      // If it starts with 1 and has 11 digits, add +
+      destinationNumber = '+' + destinationNumber;
+    } else {
+      // Invalid number format
+      response.say('The number you dialed is not valid. Please try again.');
+      response.hangup();
+      res.type('text/xml');
+      res.send(response.toString());
+      return;
+    }
+  }
+  
+  console.log('Formatted destination number:', destinationNumber);
+  
+  // Dial the destination number
+  const dial = response.dial({
+    callerId: process.env.MAIN_PHONE_NUMBER, // Use your main Twilio number as caller ID
+    timeout: 30
+  });
+  dial.number(destinationNumber);
   
   res.type('text/xml');
   res.send(response.toString());
