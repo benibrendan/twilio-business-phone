@@ -73,7 +73,7 @@ app.post('/webhook/voice', (req, res) => {
     });
     
     // Ring the T33G desk phone via SIP
-    dial.sip('phone1@allcapefence.sip.umatilla.twilio.com');
+    dial.sip('phone1@allcapefence.sip.twilio.com');
     
     // Also ring mobile phone simultaneously
     dial.number(process.env.MOBILE_PHONE_NUMBER);
