@@ -69,16 +69,14 @@ app.post('/webhook/voice', (req, res) => {
       action: '/webhook/dial-status',
       method: 'POST',
       timeout: 20,
-      callerId: req.body.To // Use the Twilio number as caller ID
+      callerId: req.body.From // Use the Twilio number as caller ID
     });
     
     // Ring both desk phones via SIP
     dial.sip('sip:phone1@allcapefence.sip.twilio.com');
     dial.sip('sip:phone2@allcapefence.sip.twilio.com');
     
-
-
-console.log(response.toString());
+    console.log(response.toString());
     
   } else {
     // After hours: Straight to voicemail
