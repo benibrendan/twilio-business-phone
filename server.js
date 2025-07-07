@@ -65,7 +65,7 @@ app.post('/webhook/voice', (req, res) => {
     response.say('Thank you for calling All Cape Fence. Please hold while we connect you.');
     
     // Dial both desk phones simultaneously
-    const dial = response.dial({
+    /*const dial = response.dial({
       action: '/webhook/dial-status',
       method: 'POST',
       timeout: 20,
@@ -75,6 +75,17 @@ app.post('/webhook/voice', (req, res) => {
     // Ring both desk phones via SIP
     dial.sip('sip:phone1@allcapefence.sip.twilio.com');
     dial.sip('sip:phone2@allcapefence.sip.twilio.com');
+    */
+
+    const response = new twilio.twiml.VoiceResponse();
+    const dial = response.dial({
+      timeout: 30
+    });
+
+    dial.sip('sip:phone1@allcapefence.sip.twilio.com');
+    dial.sip('sip:phone2@allcapefence.sip.twilio.com');
+
+console.log(response.toString());
     
   } else {
     // After hours: Straight to voicemail
