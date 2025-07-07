@@ -73,8 +73,8 @@ app.post('/webhook/voice', (req, res) => {
     });
     
     // Ring both desk phones via SIP
-    dial.sip('phone1@allcapefence.sip.twilio.com');
-    dial.sip('phone2@allcapefence.sip.twilio.com');
+    dial.sip('sip:phone1@allcapefence.sip.twilio.com');
+    dial.sip('sip:phone2@allcapefence.sip.twilio.com');
     
   } else {
     // After hours: Straight to voicemail
