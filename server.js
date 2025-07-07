@@ -61,10 +61,10 @@ app.post('/webhook/voice', (req, res) => {
   const isBusinessHours = (day >= 1 && day <= 5) && (hour >= 8 && hour < 17);
   
   if (isBusinessHours) {
-    // Business hours: Ring desk phone for 20 seconds, then voicemail
+    // Business hours: Ring both desk phones simultaneously, then mobile, then voicemail
     response.say('Thank you for calling All Cape Fence. Please hold while we connect you.');
     
-    // Dial the T33G desk phone
+    // Dial both desk phones simultaneously
     const dial = response.dial({
       action: '/webhook/dial-status',
       method: 'POST',
@@ -72,8 +72,9 @@ app.post('/webhook/voice', (req, res) => {
       callerId: req.body.To // Use the Twilio number as caller ID
     });
     
-    // Ring the T33G desk phone via SIP
+    // Ring both desk phones via SIP
     dial.sip('phone1@allcapefence.sip.twilio.com');
+    dial.sip('phone2@allcapefence.sip.twilio.com');
     
   } else {
     // After hours: Straight to voicemail
@@ -94,14 +95,45 @@ app.post('/webhook/voice', (req, res) => {
   res.send(response.toString());
 });
 
-// Handle dial status (when desk phone doesn't answer)
+// Handle dial status (when desk phones don't answer or are busy)
 app.post('/webhook/dial-status', (req, res) => {
   console.log('Dial status:', req.body.DialCallStatus);
   console.log('Dial duration:', req.body.DialCallDuration);
   
   const response = new twiml.VoiceResponse();
   
-  // If the call wasn't answered, go to voicemail
+  // If both desk phones didn't answer, try mobile phone
+  if (req.body.DialCallStatus === 'no-answer' || req.body.DialCallStatus === 'busy' || req.body.DialCallStatus === 'failed') {
+    
+    // Try mobile phone as fallback
+    response.say('Please continue to hold while we try to reach you.');
+    
+    const mobileDial = response.dial({
+      action: '/webhook/mobile-dial-status',
+      method: 'POST',
+      timeout: 15,
+      callerId: req.body.To
+    });
+    
+    mobileDial.number(process.env.MOBILE_PHONE_NUMBER || '+16174139699');
+    
+  } else {
+    // Call was answered by one of the desk phones, no further action needed
+    response.hangup();
+  }
+  
+  res.type('text/xml');
+  res.send(response.toString());
+});
+
+// Handle mobile phone dial status (final fallback to voicemail)
+app.post('/webhook/mobile-dial-status', (req, res) => {
+  console.log('Mobile dial status:', req.body.DialCallStatus);
+  console.log('Mobile dial duration:', req.body.DialCallDuration);
+  
+  const response = new twiml.VoiceResponse();
+  
+  // If mobile phone doesn't answer either, go to voicemail
   if (req.body.DialCallStatus === 'no-answer' || req.body.DialCallStatus === 'busy' || req.body.DialCallStatus === 'failed') {
     response.say('We are currently with other customers. Please leave a message after the beep.');
     
@@ -115,7 +147,7 @@ app.post('/webhook/dial-status', (req, res) => {
     
     response.say('We did not receive a recording. Goodbye.');
   } else {
-    // Call was answered, no further action needed
+    // Mobile phone answered
     response.hangup();
   }
   
