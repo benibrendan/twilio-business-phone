@@ -72,9 +72,10 @@ app.post('/webhook/voice', (req, res) => {
       callerId: req.body.From // Use the Twilio number as caller ID
     });
     
-    // Ring both desk phones via SIP
+    // Ring desk phones and office wireless via SIP
     dial.sip('sip:phone1@allcapefence.sip.twilio.com');
     dial.sip('sip:phone2@allcapefence.sip.twilio.com');
+    dial.sip('sip:phone3@allcapefence.sip.twilio.com');
     
     console.log(response.toString());
     
@@ -108,7 +109,7 @@ app.post('/webhook/dial-status', (req, res) => {
   if (req.body.DialCallStatus === 'no-answer' || req.body.DialCallStatus === 'busy' || req.body.DialCallStatus === 'failed') {
     
     // Try mobile phone as fallback
-    response.say('Please continue to hold while we try to reach you.');
+    response.say('Please continue to hold while we try to a team member for you.');
     
     const mobileDial = response.dial({
       action: '/webhook/mobile-dial-status',
