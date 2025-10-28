@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { twiml } = require('twilio');
-const nodemailer = require('nodemailer');
+const nodemailer = require('nodemailer').default;
 
 // Temporary hardcoded credentials (REMOVE after testing)
 // Replace with your actual values
