@@ -264,6 +264,7 @@ async function sendVoicemailEmail(recordingData) {
     from: recordingData.From,
     duration: recordingData.RecordingDuration,
     url: recordingData.RecordingUrl,
+    sid: recordingData.RecordingSid,
     hasAllData: !!(recordingData.From && recordingData.RecordingDuration && recordingData.RecordingUrl)
   });
 
@@ -293,32 +294,55 @@ async function sendVoicemailEmail(recordingData) {
 
     console.log('📧 [EMAIL] Downloading recording from Twilio...');
     
-    // Get the recording SID from the URL
-    const recordingSid = recordingData.RecordingSid || recordingData.RecordingUrl.split('/').pop();
+    // Get the recording SID from the data
+    const recordingSid = recordingData.RecordingSid;
     console.log('📧 [EMAIL] Recording SID:', recordingSid);
 
-    // Download the recording file from Twilio
-    const recordingMp3Url = recordingData.RecordingUrl.replace('.json', '.mp3');
+    // CRITICAL FIX: The RecordingUrl already points to the correct resource
+    // We need to add .mp3 extension AND add authentication
+    let recordingMp3Url = recordingData.RecordingUrl;
+    
+    // If the URL ends with the SID (no extension), add .mp3
+    if (recordingMp3Url.endsWith(recordingSid)) {
+      recordingMp3Url = recordingMp3Url + '.mp3';
+    }
+    // If it ends with .json, replace with .mp3
+    else if (recordingMp3Url.endsWith('.json')) {
+      recordingMp3Url = recordingMp3Url.replace('.json', '.mp3');
+    }
+    
+    console.log('📧 [EMAIL] MP3 URL:', recordingMp3Url);
+
+    // Create Basic Auth header
     const authHeader = 'Basic ' + Buffer.from(
       `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
     ).toString('base64');
 
-    console.log('📧 [EMAIL] Fetching audio file from:', recordingMp3Url);
+    console.log('📧 [EMAIL] Fetching audio file with authentication...');
     const audioResponse = await fetch(recordingMp3Url, {
+      method: 'GET',
       headers: {
         'Authorization': authHeader
       }
     });
 
+    console.log('📧 [EMAIL] Fetch response status:', audioResponse.status);
+    console.log('📧 [EMAIL] Fetch response headers:', Object.fromEntries(audioResponse.headers.entries()));
+
     if (!audioResponse.ok) {
-      throw new Error(`Failed to download recording: ${audioResponse.status}`);
+      // Log more details about the error
+      const errorText = await audioResponse.text();
+      console.error('❌ [EMAIL] Failed to download recording');
+      console.error('❌ [EMAIL] Status:', audioResponse.status);
+      console.error('❌ [EMAIL] Response:', errorText);
+      throw new Error(`Failed to download recording: ${audioResponse.status} - ${errorText}`);
     }
 
     // Get the audio file as buffer
     const audioBuffer = await audioResponse.arrayBuffer();
     const audioBase64 = Buffer.from(audioBuffer).toString('base64');
     
-    console.log('📧 [EMAIL] Audio file downloaded:', {
+    console.log('📧 [EMAIL] Audio file downloaded successfully:', {
       size: audioBuffer.byteLength,
       sizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB'
     });
