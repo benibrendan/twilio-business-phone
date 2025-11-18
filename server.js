@@ -372,10 +372,14 @@ async function sendVoicemailEmail(recordingData) {
     // Format phone number for filename
     const phoneNumber = recordingData.From.replace(/[^0-9]/g, '');
     
-    // Get current time in EST
+    // Get current time in EST - FIXED VERSION
     const now = new Date();
-    const estTime = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
-    const estTimeFormatted = estTime.toLocaleString("en-US", {
+    
+    // Log for debugging
+    console.log('📧 [EMAIL] Current UTC time:', now.toISOString());
+    
+    // Format in EST timezone - this is the correct way
+    const estTimeFormatted = now.toLocaleString("en-US", {
       timeZone: "America/New_York",
       weekday: 'short',
       year: 'numeric',
@@ -385,10 +389,12 @@ async function sendVoicemailEmail(recordingData) {
       minute: '2-digit',
       second: '2-digit',
       hour12: true
-    });
+    }) + ' EST';
     
-    // Timestamp for filename (YYYY-MM-DD-HHMMSS)
-    const timestamp = estTime.toISOString().replace(/[:.]/g, '-').split('.')[0].replace('T', '-');
+    console.log('📧 [EMAIL] Formatted EST time:', estTimeFormatted);
+    
+    // Timestamp for filename (use UTC ISO format then convert)
+    const timestamp = now.toISOString().replace(/[:.]/g, '-').split('.')[0].replace('T', '-');
     const filename = `voicemail-${phoneNumber}-${timestamp}.mp3`;
 
     const emailData = {
@@ -412,7 +418,7 @@ New voicemail received!
 
 From: ${recordingData.From}
 Duration: ${recordingData.RecordingDuration} seconds
-Received: ${estTimeFormatted} EST
+Received: ${estTimeFormatted}
 
 The voicemail audio file is attached to this email.
 
@@ -425,7 +431,7 @@ This is an automated notification from your Twilio voicemail system.
             <h2 style="color: #2563eb; margin-top: 0;">📞 New Voicemail Received</h2>
             <p><strong>From:</strong> ${recordingData.From}</p>
             <p><strong>Duration:</strong> ${recordingData.RecordingDuration} seconds</p>
-            <p><strong>Received:</strong> ${estTimeFormatted} EST</p>
+            <p><strong>Received:</strong> ${estTimeFormatted}</p>
             <div style="background: #f0f9ff; padding: 15px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #2563eb;">
               <p style="margin: 0; color: #1e40af;">
                 🎧 <strong>The voicemail audio file is attached to this email.</strong>
