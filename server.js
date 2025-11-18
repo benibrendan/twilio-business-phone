@@ -272,6 +272,8 @@ async function sendVoicemailEmail(recordingData) {
     hasBrevoApiKey: !!process.env.BREVO_API_KEY,
     hasBrevoSender: !!process.env.BREVO_SENDER_EMAIL,
     hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL,
+    hasTwilioSid: !!process.env.TWILIO_ACCOUNT_SID,
+    hasTwilioToken: !!process.env.TWILIO_AUTH_TOKEN,
     brevoKeyLength: process.env.BREVO_API_KEY?.length,
     brevoSender: process.env.BREVO_SENDER_EMAIL,
     notificationEmail: process.env.NOTIFICATION_EMAIL
@@ -285,12 +287,52 @@ async function sendVoicemailEmail(recordingData) {
     if (!process.env.BREVO_SENDER_EMAIL) {
       throw new Error('BREVO_SENDER_EMAIL environment variable is not set');
     }
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+      throw new Error('Twilio credentials not set');
+    }
 
-    console.log('📧 [EMAIL] Creating Brevo email message...');
+    console.log('📧 [EMAIL] Downloading recording from Twilio...');
     
+    // Get the recording SID from the URL
+    const recordingSid = recordingData.RecordingSid || recordingData.RecordingUrl.split('/').pop();
+    console.log('📧 [EMAIL] Recording SID:', recordingSid);
+
+    // Download the recording file from Twilio
+    const recordingMp3Url = recordingData.RecordingUrl.replace('.json', '.mp3');
+    const authHeader = 'Basic ' + Buffer.from(
+      `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+    ).toString('base64');
+
+    console.log('📧 [EMAIL] Fetching audio file from:', recordingMp3Url);
+    const audioResponse = await fetch(recordingMp3Url, {
+      headers: {
+        'Authorization': authHeader
+      }
+    });
+
+    if (!audioResponse.ok) {
+      throw new Error(`Failed to download recording: ${audioResponse.status}`);
+    }
+
+    // Get the audio file as buffer
+    const audioBuffer = await audioResponse.arrayBuffer();
+    const audioBase64 = Buffer.from(audioBuffer).toString('base64');
+    
+    console.log('📧 [EMAIL] Audio file downloaded:', {
+      size: audioBuffer.byteLength,
+      sizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB'
+    });
+
+    console.log('📧 [EMAIL] Creating Brevo email message with attachment...');
+    
+    // Format phone number for filename
+    const phoneNumber = recordingData.From.replace(/[^0-9]/g, '');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+    const filename = `voicemail-${phoneNumber}-${timestamp}.mp3`;
+
     const emailData = {
       sender: {
-        name: "Voicemail System",
+        name: "All Cape Fence Voicemail",
         email: process.env.BREVO_SENDER_EMAIL
       },
       to: [
@@ -307,7 +349,7 @@ From: ${recordingData.From}
 Duration: ${recordingData.RecordingDuration} seconds
 Received: ${new Date().toLocaleString()}
 
-Listen to recording: ${recordingData.RecordingUrl}
+The voicemail audio file is attached to this email.
 
 ---
 This is an automated notification from your Twilio voicemail system.
@@ -319,29 +361,38 @@ This is an automated notification from your Twilio voicemail system.
             <p><strong>From:</strong> ${recordingData.From}</p>
             <p><strong>Duration:</strong> ${recordingData.RecordingDuration} seconds</p>
             <p><strong>Received:</strong> ${new Date().toLocaleString()}</p>
-            <p style="margin-top: 20px;">
-              <a href="${recordingData.RecordingUrl}" 
-                 style="background-color: #2563eb; color: white; padding: 12px 24px; 
-                        text-decoration: none; border-radius: 4px; display: inline-block;">
-                🎧 Listen to Recording
-              </a>
-            </p>
+            <div style="background: #f0f9ff; padding: 15px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #2563eb;">
+              <p style="margin: 0; color: #1e40af;">
+                🎧 <strong>The voicemail audio file is attached to this email.</strong>
+              </p>
+              <p style="margin: 5px 0 0 0; font-size: 12px; color: #64748b;">
+                Filename: ${filename}
+              </p>
+            </div>
             <p style="color: #666; font-size: 12px; margin-top: 30px; border-top: 1px solid #ddd; padding-top: 10px;">
               This is an automated notification from your Twilio voicemail system.
             </p>
           </div>
         </div>
-      `
+      `,
+      attachment: [
+        {
+          content: audioBase64,
+          name: filename
+        }
+      ]
     };
 
     console.log('📧 [EMAIL] Prepared email:', {
       from: emailData.sender.email,
       to: emailData.to[0].email,
-      subject: emailData.subject
+      subject: emailData.subject,
+      attachmentName: filename,
+      attachmentSizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB'
     });
 
     // Send the email via Brevo API
-    console.log('📧 [EMAIL] Sending email via Brevo...');
+    console.log('📧 [EMAIL] Sending email with attachment via Brevo...');
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
       headers: {
@@ -358,11 +409,13 @@ This is an automated notification from your Twilio voicemail system.
       console.log('✅ ========== EMAIL SENT SUCCESSFULLY ==========');
       console.log('✅ [EMAIL] Brevo response status:', response.status);
       console.log('✅ [EMAIL] Brevo message ID:', responseData.messageId);
+      console.log('✅ [EMAIL] Attachment included:', filename);
       
       return { 
         success: true, 
         statusCode: response.status,
-        messageId: responseData.messageId
+        messageId: responseData.messageId,
+        attachmentSize: audioBuffer.byteLength
       };
     } else {
       throw new Error(`Brevo API error: ${responseData.message || 'Unknown error'}`);
