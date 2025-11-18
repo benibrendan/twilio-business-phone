@@ -251,9 +251,6 @@ app.post('/webhook/recording', async (req, res) => {
   console.log('🎙️  ========== WEBHOOK PROCESSING COMPLETE ==========\n');
 });
 
-// ============================================
-// IMPROVED EMAIL FUNCTION WITH FULL DEBUGGING
-// ============================================
 
 async function sendVoicemailEmail(recordingData) {
   console.log('📧 ========== EMAIL FUNCTION STARTED ==========');
