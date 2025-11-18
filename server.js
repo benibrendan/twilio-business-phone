@@ -272,12 +272,10 @@ async function sendVoicemailEmail(recordingData) {
   console.log('📧 [EMAIL] Environment variables check:', {
     hasBrevoApiKey: !!process.env.BREVO_API_KEY,
     hasBrevoSender: !!process.env.BREVO_SENDER_EMAIL,
-    hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL,
     hasTwilioSid: !!process.env.TWILIO_ACCOUNT_SID,
     hasTwilioToken: !!process.env.TWILIO_AUTH_TOKEN,
     brevoKeyLength: process.env.BREVO_API_KEY?.length,
-    brevoSender: process.env.BREVO_SENDER_EMAIL,
-    notificationEmail: process.env.NOTIFICATION_EMAIL
+    brevoSender: process.env.BREVO_SENDER_EMAIL
   });
 
   try {
@@ -400,8 +398,12 @@ async function sendVoicemailEmail(recordingData) {
       },
       to: [
         {
-          email: process.env.NOTIFICATION_EMAIL || process.env.BREVO_SENDER_EMAIL,
-          name: "Voicemail Recipient"
+          email: "bdowdall@allcapefence.com",
+          name: "Brendan Dowdall"
+        },
+        {
+          email: "rmastrianna@allcapefence.com",
+          name: "Robert Mastrianna"
         }
       ],
       subject: `📞 New Voicemail from ${recordingData.From}`,
@@ -448,7 +450,7 @@ This is an automated notification from your Twilio voicemail system.
 
     console.log('📧 [EMAIL] Prepared email:', {
       from: emailData.sender.email,
-      to: emailData.to[0].email,
+      to: emailData.to.map(t => t.email),
       subject: emailData.subject,
       attachmentName: filename,
       attachmentSizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB',
@@ -473,6 +475,7 @@ This is an automated notification from your Twilio voicemail system.
       console.log('✅ ========== EMAIL SENT SUCCESSFULLY ==========');
       console.log('✅ [EMAIL] Brevo response status:', response.status);
       console.log('✅ [EMAIL] Brevo message ID:', responseData.messageId);
+      console.log('✅ [EMAIL] Sent to:', emailData.to.map(t => t.email).join(', '));
       console.log('✅ [EMAIL] Attachment included:', filename);
       console.log('✅ [EMAIL] Total attempts needed:', attempts);
       
