@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const { twiml } = require('twilio');
-const nodemailer = require('nodemailer');
 
 // Temporary hardcoded credentials (REMOVE after testing)
 // Replace with your actual values
@@ -268,56 +267,40 @@ async function sendVoicemailEmail(recordingData) {
     hasAllData: !!(recordingData.From && recordingData.RecordingDuration && recordingData.RecordingUrl)
   });
 
-  // Check environment variables (CRITICAL for diagnosis)
+  // Check environment variables
   console.log('📧 [EMAIL] Environment variables check:', {
-    hasGmailUser: !!process.env.GMAIL_USER,
-    hasGmailPassword: !!process.env.GMAIL_APP_PASSWORD,
+    hasBrevoApiKey: !!process.env.BREVO_API_KEY,
+    hasBrevoSender: !!process.env.BREVO_SENDER_EMAIL,
     hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL,
-    gmailUser: process.env.GMAIL_USER,
-    gmailUserLength: process.env.GMAIL_USER?.length,
-    passwordLength: process.env.GMAIL_APP_PASSWORD?.length,
+    brevoKeyLength: process.env.BREVO_API_KEY?.length,
+    brevoSender: process.env.BREVO_SENDER_EMAIL,
     notificationEmail: process.env.NOTIFICATION_EMAIL
   });
 
   try {
     // Validate environment variables
-    if (!process.env.GMAIL_USER) {
-      throw new Error('GMAIL_USER environment variable is not set');
+    if (!process.env.BREVO_API_KEY) {
+      throw new Error('BREVO_API_KEY environment variable is not set');
     }
-    if (!process.env.GMAIL_APP_PASSWORD) {
-      throw new Error('GMAIL_APP_PASSWORD environment variable is not set');
+    if (!process.env.BREVO_SENDER_EMAIL) {
+      throw new Error('BREVO_SENDER_EMAIL environment variable is not set');
     }
 
-    console.log('📧 [EMAIL] Creating nodemailer transporter...');
-    const transporter = nodemailer.createTransporter({
-      service: 'gmail',
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD
+    console.log('📧 [EMAIL] Creating Brevo email message...');
+    
+    const emailData = {
+      sender: {
+        name: "Voicemail System",
+        email: process.env.BREVO_SENDER_EMAIL
       },
-      debug: true,  // Enable debug output
-      logger: true   // Log SMTP traffic to console
-    });
-
-    // Verify transporter can connect (this catches auth errors early)
-    console.log('📧 [EMAIL] Verifying SMTP connection...');
-    try {
-      await transporter.verify();
-      console.log('✅ [EMAIL] SMTP connection verified successfully!');
-    } catch (verifyError) {
-      console.error('❌ [EMAIL] SMTP verification failed!');
-      console.error('❌ [EMAIL] Verify error details:', {
-        name: verifyError.name,
-        message: verifyError.message,
-        code: verifyError.code,
-        command: verifyError.command
-      });
-      throw new Error(`Gmail authentication failed: ${verifyError.message}`);
-    }
-
-    // Build email content
-    const recipientEmail = process.env.NOTIFICATION_EMAIL || process.env.GMAIL_USER;
-    const emailBody = `
+      to: [
+        {
+          email: process.env.NOTIFICATION_EMAIL || process.env.BREVO_SENDER_EMAIL,
+          name: "Voicemail Recipient"
+        }
+      ],
+      subject: `📞 New Voicemail from ${recordingData.From}`,
+      textContent: `
 New voicemail received!
 
 From: ${recordingData.From}
@@ -328,15 +311,8 @@ Listen to recording: ${recordingData.RecordingUrl}
 
 ---
 This is an automated notification from your Twilio voicemail system.
-    `;
-
-    const mailOptions = {
-      from: process.env.GMAIL_USER,
-      to: recipientEmail,
-      subject: `📞 New Voicemail from ${recordingData.From}`,
-      text: emailBody,
-      // Optional: Add HTML version for better formatting
-      html: `
+      `,
+      htmlContent: `
         <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
           <div style="background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
             <h2 style="color: #2563eb; margin-top: 0;">📞 New Voicemail Received</h2>
@@ -359,44 +335,52 @@ This is an automated notification from your Twilio voicemail system.
     };
 
     console.log('📧 [EMAIL] Prepared email:', {
-      from: mailOptions.from,
-      to: mailOptions.to,
-      subject: mailOptions.subject,
-      bodyLength: mailOptions.text.length
+      from: emailData.sender.email,
+      to: emailData.to[0].email,
+      subject: emailData.subject
     });
 
-    // Send the email
-    console.log('📧 [EMAIL] Sending email now...');
-    const info = await transporter.sendMail(mailOptions);
+    // Send the email via Brevo API
+    console.log('📧 [EMAIL] Sending email via Brevo...');
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': process.env.BREVO_API_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(emailData)
+    });
+
+    const responseData = await response.json();
     
-    console.log('✅ ========== EMAIL SENT SUCCESSFULLY ==========');
-    console.log('✅ [EMAIL] Message ID:', info.messageId);
-    console.log('✅ [EMAIL] Response:', info.response);
-    console.log('✅ [EMAIL] Accepted recipients:', info.accepted);
-    console.log('✅ [EMAIL] Rejected recipients:', info.rejected);
-    
-    return { 
-      success: true, 
-      messageId: info.messageId,
-      response: info.response 
-    };
+    if (response.ok) {
+      console.log('✅ ========== EMAIL SENT SUCCESSFULLY ==========');
+      console.log('✅ [EMAIL] Brevo response status:', response.status);
+      console.log('✅ [EMAIL] Brevo message ID:', responseData.messageId);
+      
+      return { 
+        success: true, 
+        statusCode: response.status,
+        messageId: responseData.messageId
+      };
+    } else {
+      throw new Error(`Brevo API error: ${responseData.message || 'Unknown error'}`);
+    }
 
   } catch (error) {
     console.error('❌ ========== EMAIL FAILED ==========');
     console.error('❌ [EMAIL] Error type:', error.constructor.name);
     console.error('❌ [EMAIL] Error message:', error.message);
     console.error('❌ [EMAIL] Error code:', error.code);
-    console.error('❌ [EMAIL] Error command:', error.command);
     
-    // Log the full error object for maximum debugging info
+    // Log the full error object
     console.error('❌ [EMAIL] Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
     
-    // Return structured error info
     return { 
       success: false, 
       error: error.message,
-      code: error.code,
-      command: error.command
+      code: error.code
     };
   }
 }
@@ -622,6 +606,10 @@ app.listen(PORT, () => {
 // ============================================
 
 // Test email functionality without making a phone call
+// Updated diagnostic endpoints for Brevo
+// Replace your existing /test-email and /diagnose endpoints with these
+
+// Test email functionality without making a phone call
 app.get('/test-email', async (req, res) => {
   console.log('🧪 [TEST] Test email endpoint called');
   
@@ -640,16 +628,17 @@ app.get('/test-email', async (req, res) => {
         <html>
           <head><title>Email Test Result</title></head>
           <body style="font-family: Arial, sans-serif; padding: 40px;">
-            <h1 style="color: green;">✅ Test Email Sent Successfully!</h1>
+            <h1 style="color: green;">✅ Test Email Sent Successfully via Brevo!</h1>
+            <p><strong>Status Code:</strong> ${result.statusCode}</p>
             <p><strong>Message ID:</strong> ${result.messageId}</p>
-            <p><strong>Response:</strong> ${result.response}</p>
-            <p>Check your inbox at: <strong>${process.env.NOTIFICATION_EMAIL || process.env.GMAIL_USER}</strong></p>
+            <p>Check your inbox at: <strong>${process.env.NOTIFICATION_EMAIL || process.env.BREVO_SENDER_EMAIL}</strong></p>
             <p style="margin-top: 30px; color: #666;">
               If you don't see the email within 2 minutes:
               <ul>
                 <li>Check your spam folder</li>
                 <li>Verify the email address in your Railway environment variables</li>
                 <li>Check Railway logs for more details</li>
+                <li>Verify your Brevo API key is active</li>
               </ul>
             </p>
             <p><a href="/diagnose">Run Full Diagnostics</a></p>
@@ -683,12 +672,12 @@ app.get('/test-email', async (req, res) => {
           <pre style="background: #f5f5f5; padding: 15px; border-radius: 4px;">${error.stack}</pre>
           <p><a href="/diagnose">Run Full Diagnostics</a></p>
         </body>
-        </html>
+      </html>
     `);
   }
 });
 
-// Comprehensive diagnostic endpoint
+// Comprehensive diagnostic endpoint for Brevo
 app.get('/diagnose', async (req, res) => {
   console.log('🔍 [DIAGNOSE] Running comprehensive diagnostics...');
   
@@ -697,56 +686,75 @@ app.get('/diagnose', async (req, res) => {
     environment: {
       nodeVersion: process.version,
       platform: process.platform,
-      hasGmailUser: !!process.env.GMAIL_USER,
-      hasGmailPassword: !!process.env.GMAIL_APP_PASSWORD,
+      hasBrevoApiKey: !!process.env.BREVO_API_KEY,
+      hasBrevoSender: !!process.env.BREVO_SENDER_EMAIL,
       hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL,
-      gmailUser: process.env.GMAIL_USER || 'NOT SET',
-      gmailUserLength: process.env.GMAIL_USER?.length || 0,
-      passwordLength: process.env.GMAIL_APP_PASSWORD?.length || 0,
-      notificationEmail: process.env.NOTIFICATION_EMAIL || 'NOT SET (will use GMAIL_USER)'
+      brevoKeyLength: process.env.BREVO_API_KEY?.length || 0,
+      brevoKeyPrefix: process.env.BREVO_API_KEY?.substring(0, 15) || 'NOT SET',
+      brevoSender: process.env.BREVO_SENDER_EMAIL || 'NOT SET',
+      notificationEmail: process.env.NOTIFICATION_EMAIL || 'NOT SET (will use BREVO_SENDER_EMAIL)'
     },
     tests: {}
   };
 
   // Test 1: Environment variables
   diagnosis.tests.environmentVariables = {
-    status: (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD) ? 'PASS' : 'FAIL',
-    details: !process.env.GMAIL_USER ? 'GMAIL_USER is missing' : 
-             !process.env.GMAIL_APP_PASSWORD ? 'GMAIL_APP_PASSWORD is missing' : 
+    status: (process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL) ? 'PASS' : 'FAIL',
+    details: !process.env.BREVO_API_KEY ? 'BREVO_API_KEY is missing' : 
+             !process.env.BREVO_SENDER_EMAIL ? 'BREVO_SENDER_EMAIL is missing' : 
              'All required variables present'
   };
 
-  // Test 2: Nodemailer transporter creation
-  try {
-    const transporter = nodemailer.createTransporter({
-      service: 'gmail',
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD
-      }
-    });
-    diagnosis.tests.transporterCreation = { status: 'PASS', details: 'Transporter created successfully' };
-    
-    // Test 3: SMTP connection verification
+  // Test 2: Brevo API key format
+  if (process.env.BREVO_API_KEY) {
+    const isValidFormat = process.env.BREVO_API_KEY.startsWith('xkeysib-');
+    diagnosis.tests.apiKeyFormat = {
+      status: isValidFormat ? 'PASS' : 'FAIL',
+      details: isValidFormat ? 'API key has correct xkeysib- prefix' : 'API key should start with "xkeysib-"'
+    };
+  } else {
+    diagnosis.tests.apiKeyFormat = {
+      status: 'SKIPPED',
+      details: 'No API key to validate'
+    };
+  }
+
+  // Test 3: Test Brevo API connection
+  if (process.env.BREVO_API_KEY) {
     try {
-      await transporter.verify();
-      diagnosis.tests.smtpVerification = { 
-        status: 'PASS', 
-        details: 'Successfully connected to Gmail SMTP server' 
-      };
-    } catch (verifyError) {
-      diagnosis.tests.smtpVerification = { 
-        status: 'FAIL', 
-        details: verifyError.message,
-        code: verifyError.code,
-        hint: verifyError.code === 'EAUTH' ? 
-          'Authentication failed. Check your Gmail App Password.' : 
-          'Connection issue. Check your credentials.'
+      const response = await fetch('https://api.brevo.com/v3/account', {
+        method: 'GET',
+        headers: {
+          'accept': 'application/json',
+          'api-key': process.env.BREVO_API_KEY
+        }
+      });
+      
+      if (response.ok) {
+        const accountData = await response.json();
+        diagnosis.tests.brevoConnection = {
+          status: 'PASS',
+          details: `Connected to Brevo account: ${accountData.email || 'Unknown'}`,
+          accountInfo: accountData.email
+        };
+      } else {
+        diagnosis.tests.brevoConnection = {
+          status: 'FAIL',
+          details: `API returned status ${response.status}`,
+          hint: response.status === 401 ? 'Invalid API key' : 'API connection failed'
+        };
+      }
+    } catch (error) {
+      diagnosis.tests.brevoConnection = {
+        status: 'FAIL',
+        details: error.message
       };
     }
-  } catch (error) {
-    diagnosis.tests.transporterCreation = { status: 'FAIL', details: error.message };
-    diagnosis.tests.smtpVerification = { status: 'SKIPPED', details: 'Transporter creation failed' };
+  } else {
+    diagnosis.tests.brevoConnection = {
+      status: 'SKIPPED',
+      details: 'No API key configured'
+    };
   }
 
   // Test 4: Attempt to send test email
@@ -759,7 +767,9 @@ app.get('/diagnose', async (req, res) => {
     const emailResult = await sendVoicemailEmail(testData);
     diagnosis.tests.sendTestEmail = {
       status: emailResult.success ? 'PASS' : 'FAIL',
-      details: emailResult.success ? `Email sent! Message ID: ${emailResult.messageId}` : emailResult.error,
+      details: emailResult.success ? 
+        `Email sent! Status code: ${emailResult.statusCode}, Message ID: ${emailResult.messageId}` : 
+        emailResult.error,
       messageId: emailResult.messageId
     };
   } catch (error) {
@@ -776,7 +786,7 @@ app.get('/diagnose', async (req, res) => {
   const htmlResponse = `
     <html>
       <head>
-        <title>Twilio Email Diagnostics</title>
+        <title>Twilio Email Diagnostics (Brevo)</title>
         <style>
           body { font-family: Arial, sans-serif; padding: 40px; background: #f5f5f5; }
           .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -793,13 +803,13 @@ app.get('/diagnose', async (req, res) => {
           .status.pass { color: #16a34a; }
           .status.fail { color: #dc2626; }
           .status.skipped { color: #f59e0b; }
-          pre { background: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; }
+          pre { background: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
           .hint { background: #fff4d5; padding: 10px; border-radius: 4px; margin-top: 10px; border-left: 4px solid #f59e0b; }
         </style>
       </head>
       <body>
         <div class="container">
-          <h1>🔍 Twilio Voicemail Email Diagnostics</h1>
+          <h1>🔍 Twilio Voicemail Email Diagnostics (Brevo)</h1>
           <p><strong>Timestamp:</strong> ${diagnosis.timestamp}</p>
           
           <div class="summary">
@@ -824,7 +834,7 @@ app.get('/diagnose', async (req, res) => {
                 ${testName.replace(/([A-Z])/g, ' $1').trim()}
               </div>
               <p><strong>Details:</strong> ${result.details}</p>
-              ${result.code ? `<p><strong>Error Code:</strong> ${result.code}</p>` : ''}
+              ${result.accountInfo ? `<p><strong>Account:</strong> ${result.accountInfo}</p>` : ''}
               ${result.messageId ? `<p><strong>Message ID:</strong> ${result.messageId}</p>` : ''}
               ${result.hint ? `<div class="hint">💡 <strong>Hint:</strong> ${result.hint}</div>` : ''}
             </div>
@@ -835,10 +845,12 @@ app.get('/diagnose', async (req, res) => {
             <div style="background: #fef2f2; padding: 15px; border-radius: 6px; border-left: 4px solid #dc2626;">
               <p><strong>Issues detected!</strong> Follow these steps:</p>
               <ol>
-                ${!process.env.GMAIL_USER || !process.env.GMAIL_APP_PASSWORD ? 
+                ${!process.env.BREVO_API_KEY || !process.env.BREVO_SENDER_EMAIL ? 
                   '<li>Set missing environment variables in Railway</li>' : ''}
-                ${diagnosis.tests.smtpVerification?.status === 'FAIL' ? 
-                  '<li>Generate a new Gmail App Password: <a href="https://myaccount.google.com/apppasswords" target="_blank">Google App Passwords</a></li><li>Update GMAIL_APP_PASSWORD in Railway</li><li>Restart your Railway app</li>' : ''}
+                ${diagnosis.tests.apiKeyFormat?.status === 'FAIL' ? 
+                  '<li>Your API key doesn\'t start with "xkeysib-" - check your Brevo dashboard for the correct key</li>' : ''}
+                ${diagnosis.tests.brevoConnection?.status === 'FAIL' ? 
+                  '<li>Verify your API key at: <a href="https://app.brevo.com/settings/keys/api" target="_blank">Brevo API Keys</a></li>' : ''}
               </ol>
             </div>
           ` : `
