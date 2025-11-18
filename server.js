@@ -307,7 +307,7 @@ async function sendVoicemailEmail(recordingData) {
       `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
     ).toString('base64');
 
-    // CRITICAL FIX: Wait for recording to be ready, with retries
+    // Wait for recording to be ready, with retries
     let audioBuffer = null;
     let attempts = 0;
     const maxAttempts = 5;
@@ -373,7 +373,24 @@ async function sendVoicemailEmail(recordingData) {
     
     // Format phone number for filename
     const phoneNumber = recordingData.From.replace(/[^0-9]/g, '');
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0];
+    
+    // Get current time in EST
+    const now = new Date();
+    const estTime = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
+    const estTimeFormatted = estTime.toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+    
+    // Timestamp for filename (YYYY-MM-DD-HHMMSS)
+    const timestamp = estTime.toISOString().replace(/[:.]/g, '-').split('.')[0].replace('T', '-');
     const filename = `voicemail-${phoneNumber}-${timestamp}.mp3`;
 
     const emailData = {
@@ -393,7 +410,7 @@ New voicemail received!
 
 From: ${recordingData.From}
 Duration: ${recordingData.RecordingDuration} seconds
-Received: ${new Date().toLocaleString()}
+Received: ${estTimeFormatted} EST
 
 The voicemail audio file is attached to this email.
 
@@ -406,7 +423,7 @@ This is an automated notification from your Twilio voicemail system.
             <h2 style="color: #2563eb; margin-top: 0;">📞 New Voicemail Received</h2>
             <p><strong>From:</strong> ${recordingData.From}</p>
             <p><strong>Duration:</strong> ${recordingData.RecordingDuration} seconds</p>
-            <p><strong>Received:</strong> ${new Date().toLocaleString()}</p>
+            <p><strong>Received:</strong> ${estTimeFormatted} EST</p>
             <div style="background: #f0f9ff; padding: 15px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #2563eb;">
               <p style="margin: 0; color: #1e40af;">
                 🎧 <strong>The voicemail audio file is attached to this email.</strong>
@@ -434,7 +451,8 @@ This is an automated notification from your Twilio voicemail system.
       to: emailData.to[0].email,
       subject: emailData.subject,
       attachmentName: filename,
-      attachmentSizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB'
+      attachmentSizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB',
+      receivedTime: estTimeFormatted
     });
 
     // Send the email via Brevo API
