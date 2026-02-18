@@ -407,6 +407,10 @@ async function sendVoicemailEmail(recordingData) {
         {
           email: "rmastrianna@allcapefence.com",
           name: "Robert Mastrianna"
+        },
+        {
+          email: "pcollura@allcapefence.com",
+          name: "Pete Collura"
         }
       ],
       subject: `📞 New Voicemail from ${recordingData.From}`,
