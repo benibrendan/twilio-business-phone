@@ -3,7 +3,7 @@ const express = require('express');
 const { twiml } = require('twilio');
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
 const { AssemblyAI } = require('assemblyai');
 const path = require('path');
 const fs = require('fs');
@@ -44,42 +44,95 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
 // ============================================
-// DATABASE SETUP (SQLite on Railway persistent disk)
+// DATABASE SETUP (sql.js — pure JS SQLite, no native build needed)
 // ============================================
 const DATA_DIR = process.env.DATA_DIR || '/data';
+const DB_PATH  = path.join(DATA_DIR, 'calls.db');
+
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const db = new Database(path.join(DATA_DIR, 'calls.db'));
+// sql.js loads asynchronously; we initialise it once and expose a
+// synchronous-style wrapper so the rest of the file is unchanged.
+let _db = null;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS calls (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    call_sid          TEXT UNIQUE,
-    recording_sid     TEXT,
-    from_number       TEXT,
-    to_number         TEXT,
-    direction         TEXT DEFAULT 'inbound',
-    duration_seconds  INTEGER,
-    r2_key            TEXT,
-    transcript_raw    TEXT,
-    transcript_pretty TEXT,
-    recording_status  TEXT DEFAULT 'pending',
-    transcript_status TEXT DEFAULT 'pending',
-    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+async function initDb() {
+  const SQL = await initSqlJs();
+  // Load existing DB file if it exists, otherwise start fresh
+  const fileBuffer = fs.existsSync(DB_PATH) ? fs.readFileSync(DB_PATH) : null;
+  _db = fileBuffer ? new SQL.Database(fileBuffer) : new SQL.Database();
 
-  CREATE TABLE IF NOT EXISTS voicemails (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    call_sid         TEXT UNIQUE,
-    recording_sid    TEXT,
-    from_number      TEXT,
-    duration_seconds INTEGER,
-    r2_key           TEXT,
-    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-`);
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS calls (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_sid          TEXT UNIQUE,
+      recording_sid     TEXT,
+      from_number       TEXT,
+      to_number         TEXT,
+      direction         TEXT DEFAULT 'inbound',
+      duration_seconds  INTEGER,
+      r2_key            TEXT,
+      transcript_raw    TEXT,
+      transcript_pretty TEXT,
+      recording_status  TEXT DEFAULT 'pending',
+      transcript_status TEXT DEFAULT 'pending',
+      created_at        DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS voicemails (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_sid         TEXT UNIQUE,
+      recording_sid    TEXT,
+      from_number      TEXT,
+      duration_seconds INTEGER,
+      r2_key           TEXT,
+      created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  persistDb(); // write initial file
+  console.log('Database initialised at', DB_PATH);
+}
+
+// Write DB to disk after every mutating operation
+function persistDb() {
+  if (!_db) return;
+  try {
+    const data = _db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch (e) {
+    console.error('DB persist error:', e.message);
+  }
+}
+
+// Thin wrapper that mimics better-sqlite3's .prepare().run() / .all() / .get()
+const db = {
+  prepare(sql) {
+    return {
+      run(...params)  {
+        _db.run(sql, params);
+        persistDb();
+      },
+      all(...params)  {
+        const stmt = _db.prepare(sql);
+        const rows = [];
+        stmt.bind(params);
+        while (stmt.step()) rows.push(stmt.getAsObject());
+        stmt.free();
+        return rows;
+      },
+      get(...params) {
+        const stmt = _db.prepare(sql);
+        stmt.bind(params);
+        const row = stmt.step() ? stmt.getAsObject() : null;
+        stmt.free();
+        return row;
+      }
+    };
+  },
+  exec(sql) { _db.run(sql); persistDb(); }
+};
 
 // ============================================
 // CLOUDFLARE R2 CLIENT
@@ -902,13 +955,18 @@ app.get('/diagnose', async (req, res) => {
 });
 
 // ============================================
-// START
+// START (DB must init before accepting requests)
 // ============================================
-app.listen(PORT, () => {
-  console.log(`\nAll Cape Fence Phone System on port ${PORT}`);
-  console.log(`Webhook:    https://twilio-business-phone-production.up.railway.app/webhook/voice`);
-  console.log(`Dashboard:  https://twilio-business-phone-production.up.railway.app/calls`);
-  console.log(`Voicemails: https://twilio-business-phone-production.up.railway.app/voicemails`);
-  console.log(`R2 bucket:  ${process.env.R2_BUCKET_NAME || 'NOT CONFIGURED'}`);
-  console.log(`AssemblyAI: ${process.env.ASSEMBLYAI_API_KEY ? 'configured' : 'NOT CONFIGURED'}\n`);
+initDb().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\nAll Cape Fence Phone System on port ${PORT}`);
+    console.log(`Webhook:    https://twilio-business-phone-production.up.railway.app/webhook/voice`);
+    console.log(`Dashboard:  https://twilio-business-phone-production.up.railway.app/calls`);
+    console.log(`Voicemails: https://twilio-business-phone-production.up.railway.app/voicemails`);
+    console.log(`R2 bucket:  ${process.env.R2_BUCKET_NAME || 'NOT CONFIGURED'}`);
+    console.log(`AssemblyAI: ${process.env.ASSEMBLYAI_API_KEY ? 'configured' : 'NOT CONFIGURED'}\n`);
+  });
+}).catch(err => {
+  console.error('Failed to initialise database:', err);
+  process.exit(1);
 });
