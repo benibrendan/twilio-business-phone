@@ -16,6 +16,10 @@
   "author": "Your Name",
   "license": "ISC",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1000.0",
+    "@aws-sdk/s3-request-presigner": "^3.1000.0",
+    "assemblyai": "^4.25.0",
+    "better-sqlite3": "^12.6.2",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "twilio": "^4.19.0"

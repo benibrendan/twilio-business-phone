@@ -1,87 +1,439 @@
 require('dotenv').config();
 const express = require('express');
 const { twiml } = require('twilio');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const Database = require('better-sqlite3');
+const { AssemblyAI } = require('assemblyai');
+const path = require('path');
+const fs = require('fs');
 
-// Temporary hardcoded credentials (REMOVE after testing)
-// Replace with your actual values
-if (!process.env.TWILIO_ACCOUNT_SID) {
-  process.env.TWILIO_ACCOUNT_SID = 'YOUR_ACCOUNT_SID_HERE';
-}
-if (!process.env.TWILIO_AUTH_TOKEN) {
-  process.env.TWILIO_AUTH_TOKEN = 'YOUR_AUTH_TOKEN_HERE';
-}
+// ============================================
+// ENVIRONMENT VARIABLES (set all in Railway)
+// ============================================
+// TWILIO_ACCOUNT_SID
+// TWILIO_AUTH_TOKEN
+// MAIN_PHONE_NUMBER
+// SECONDARY_PHONE_NUMBER
+// SIP_DOMAIN
+// MOBILE_PHONE_NUMBER
+// BREVO_API_KEY
+// BREVO_SENDER_EMAIL
+// ASSEMBLYAI_API_KEY
+// CF_ACCOUNT_ID
+// R2_ACCESS_KEY_ID
+// R2_SECRET_ACCESS_KEY
+// R2_BUCKET_NAME          e.g. allcapefence-calls
+// DATA_DIR                defaults to /data (Railway persistent volume mount path)
 
-// Add the phone numbers temporarily
-if (!process.env.MAIN_PHONE_NUMBER) {
-  process.env.MAIN_PHONE_NUMBER = '+15083942422';
-}
-if (!process.env.SECONDARY_PHONE_NUMBER) {
-  process.env.SECONDARY_PHONE_NUMBER = '+15083943024';
-}
-if (!process.env.SIP_DOMAIN) {
-  process.env.SIP_DOMAIN = 'allcapefence.sip.twilio.com';
-}
+// ============================================
+// LOCAL DEV FALLBACKS
+// ============================================
+if (!process.env.MAIN_PHONE_NUMBER)      process.env.MAIN_PHONE_NUMBER      = '+15083942422';
+if (!process.env.SECONDARY_PHONE_NUMBER) process.env.SECONDARY_PHONE_NUMBER = '+15083943024';
+if (!process.env.SIP_DOMAIN)             process.env.SIP_DOMAIN             = 'allcapefence.sip.twilio.com';
+if (!process.env.MOBILE_PHONE_NUMBER)    process.env.MOBILE_PHONE_NUMBER    = '+16174139699';
 
-// Set mobile phone number
-if (!process.env.MOBILE_PHONE_NUMBER) {
-  process.env.MOBILE_PHONE_NUMBER = '+16174139699';
-}
-
+// ============================================
+// APP SETUP
+// ============================================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware to parse URL-encoded bodies (Twilio sends data this way)
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-// Basic route to test if server is running
-app.get('/', (req, res) => {
-  res.send('Twilio Phone System is running! 📞');
-});
+// ============================================
+// DATABASE SETUP (SQLite on Railway persistent disk)
+// ============================================
+const DATA_DIR = process.env.DATA_DIR || '/data';
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
-});
+const db = new Database(path.join(DATA_DIR, 'calls.db'));
 
-// Main webhook endpoint for incoming calls
-app.post('/webhook/voice', (req, res) => {
-  console.log('Incoming call from:', req.body.From);
-  console.log('To number:', req.body.To);
-  console.log('Call SID:', req.body.CallSid);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS calls (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_sid          TEXT UNIQUE,
+    recording_sid     TEXT,
+    from_number       TEXT,
+    to_number         TEXT,
+    direction         TEXT DEFAULT 'inbound',
+    duration_seconds  INTEGER,
+    r2_key            TEXT,
+    transcript_raw    TEXT,
+    transcript_pretty TEXT,
+    recording_status  TEXT DEFAULT 'pending',
+    transcript_status TEXT DEFAULT 'pending',
+    created_at        DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 
-  const response = new twiml.VoiceResponse();
-  
-  // Check if it's business hours (Monday-Friday 8am-5pm EST)
+  CREATE TABLE IF NOT EXISTS voicemails (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_sid         TEXT UNIQUE,
+    recording_sid    TEXT,
+    from_number      TEXT,
+    duration_seconds INTEGER,
+    r2_key           TEXT,
+    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+// ============================================
+// CLOUDFLARE R2 CLIENT
+// ============================================
+let r2Client = null;
+
+function getR2Client() {
+  if (r2Client) return r2Client;
+  if (!process.env.CF_ACCOUNT_ID || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
+    console.warn('R2 credentials not configured — recordings will not be stored in R2');
+    return null;
+  }
+  r2Client = new S3Client({
+    region: 'auto',
+    endpoint: `https://${process.env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    credentials: {
+      accessKeyId: process.env.R2_ACCESS_KEY_ID,
+      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+    }
+  });
+  return r2Client;
+}
+
+async function uploadToR2(key, buffer, contentType = 'audio/mpeg') {
+  const client = getR2Client();
+  if (!client) return null;
+  await client.send(new PutObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType
+  }));
+  return key;
+}
+
+async function getR2SignedUrl(key, expiresInSeconds = 3600) {
+  const client = getR2Client();
+  if (!client) return null;
+  const command = new GetObjectCommand({
+    Bucket: process.env.R2_BUCKET_NAME,
+    Key: key
+  });
+  return getSignedUrl(client, command, { expiresIn: expiresInSeconds });
+}
+
+// ============================================
+// ASSEMBLYAI CLIENT
+// ============================================
+function getAssemblyAI() {
+  if (!process.env.ASSEMBLYAI_API_KEY) {
+    console.warn('ASSEMBLYAI_API_KEY not set — transcription disabled');
+    return null;
+  }
+  return new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY });
+}
+
+// ============================================
+// HELPER: Download Twilio Recording (with retry)
+// ============================================
+async function downloadTwilioRecording(recordingSid, maxAttempts = 6, delayMs = 3000) {
+  const mp3Url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+  const authHeader = 'Basic ' + Buffer.from(
+    `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+  ).toString('base64');
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (attempt > 1) await new Promise(r => setTimeout(r, delayMs));
+    console.log(`Download attempt ${attempt}/${maxAttempts} for ${recordingSid}`);
+
+    const res = await fetch(mp3Url, { headers: { Authorization: authHeader } });
+    const contentType = res.headers.get('content-type') || '';
+
+    if (res.ok && contentType.includes('audio')) {
+      const arrayBuffer = await res.arrayBuffer();
+      console.log(`Downloaded ${recordingSid} (${(arrayBuffer.byteLength / 1024).toFixed(1)} KB)`);
+      return Buffer.from(arrayBuffer);
+    }
+    console.log(`Attempt ${attempt}: not ready (${res.status}, ${contentType})`);
+  }
+  throw new Error(`Failed to download recording ${recordingSid} after ${maxAttempts} attempts`);
+}
+
+// ============================================
+// HELPER: Format AssemblyAI utterances
+// ============================================
+function formatTranscript(utterances) {
+  if (!utterances || utterances.length === 0) return null;
+  return utterances.map(u => {
+    const label = u.speaker === 'A' ? 'Caller' : 'Staff';
+    const mins  = Math.floor(u.start / 60000);
+    const secs  = Math.floor((u.start % 60000) / 1000);
+    const ts    = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    return `[${ts}] ${label}: ${u.text}`;
+  }).join('\n');
+}
+
+// ============================================
+// HELPER: EST timestamp string
+// ============================================
+function getEstTimestamp() {
+  return new Date().toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true
+  }) + ' EST';
+}
+
+// ============================================
+// HELPER: Send email via Brevo
+// ============================================
+async function sendBrevoEmail({ subject, textContent, htmlContent, attachments = [] }) {
+  if (!process.env.BREVO_API_KEY) {
+    console.warn('BREVO_API_KEY not set — email skipped');
+    return { success: false, error: 'No Brevo API key' };
+  }
+
+  const payload = {
+    sender: { name: 'All Cape Fence Phone System', email: process.env.BREVO_SENDER_EMAIL },
+    to: [
+      { email: 'bdowdall@allcapefence.com',    name: 'Brendan Dowdall'   },
+      { email: 'rmastrianna@allcapefence.com',  name: 'Robert Mastrianna' },
+      { email: 'pcollura@allcapefence.com',      name: 'Pete Collura'      }
+    ],
+    subject,
+    textContent,
+    htmlContent,
+    attachment: attachments
+  };
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'accept': 'application/json',
+      'api-key': process.env.BREVO_API_KEY,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+  if (res.ok) {
+    console.log(`Email sent: ${data.messageId}`);
+    return { success: true, messageId: data.messageId };
+  } else {
+    console.error('Brevo error:', data);
+    return { success: false, error: data.message };
+  }
+}
+
+// ============================================
+// CORE: Process a call recording
+//   - Download from Twilio
+//   - Upload to R2
+//   - Transcribe with AssemblyAI
+//   - Email team
+//   - Save to DB
+// ============================================
+async function processRecording({ callSid, recordingSid, fromNumber, toNumber, direction, durationSeconds }) {
+  console.log(`\nProcessing recording for call ${callSid}...`);
+
+  // Insert pending row so dashboard shows it immediately
+  db.prepare(`
+    INSERT OR IGNORE INTO calls
+      (call_sid, recording_sid, from_number, to_number, direction, duration_seconds, recording_status, transcript_status)
+    VALUES (?, ?, ?, ?, ?, ?, 'processing', 'processing')
+  `).run(callSid, recordingSid, fromNumber, toNumber, direction, durationSeconds);
+
+  let audioBuffer    = null;
+  let r2Key          = null;
+  let transcriptPretty = null;
+  let transcriptRaw  = null;
+
+  // 1. Download from Twilio
+  try {
+    audioBuffer = await downloadTwilioRecording(recordingSid);
+
+    // 2. Upload to R2
+    r2Key = `calls/${new Date().toISOString().slice(0, 10)}/${callSid}.mp3`;
+    await uploadToR2(r2Key, audioBuffer);
+    console.log(`Uploaded to R2: ${r2Key}`);
+    db.prepare(`UPDATE calls SET r2_key = ?, recording_status = 'stored' WHERE call_sid = ?`).run(r2Key, callSid);
+  } catch (err) {
+    console.error('Recording download/upload failed:', err.message);
+    db.prepare(`UPDATE calls SET recording_status = 'failed' WHERE call_sid = ?`).run(callSid);
+  }
+
+  // 3. Transcribe with AssemblyAI
+  const aai = getAssemblyAI();
+  if (aai && audioBuffer) {
+    try {
+      const mp3Url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
+
+      console.log('Sending to AssemblyAI...');
+      const transcript = await aai.transcripts.transcribe({
+        audio_url:          mp3Url,
+        http_auth_username: process.env.TWILIO_ACCOUNT_SID,
+        http_auth_password: process.env.TWILIO_AUTH_TOKEN,
+        speaker_labels:     true,
+        speakers_expected:  2,
+        punctuate:          true,
+        format_text:        true
+      });
+
+      transcriptRaw    = transcript.text || '';
+      transcriptPretty = formatTranscript(transcript.utterances) || transcriptRaw;
+
+      db.prepare(`
+        UPDATE calls SET transcript_raw = ?, transcript_pretty = ?, transcript_status = 'complete'
+        WHERE call_sid = ?
+      `).run(transcriptRaw, transcriptPretty, callSid);
+
+      console.log('Transcription complete');
+    } catch (err) {
+      console.error('Transcription failed:', err.message);
+      db.prepare(`UPDATE calls SET transcript_status = 'failed' WHERE call_sid = ?`).run(callSid);
+    }
+  }
+
+  // 4. Send email notification
+  const timestamp      = getEstTimestamp();
+  const phoneNumber    = (fromNumber || '').replace(/[^0-9]/g, '');
+  const filename       = `call-${phoneNumber}-${(callSid || '').slice(-8)}.mp3`;
+  const audioBase64    = audioBuffer ? audioBuffer.toString('base64') : null;
+  const dirLabel       = direction === 'inbound' ? 'Inbound' : 'Outbound';
+  const dashboardUrl   = 'https://twilio-business-phone-production.up.railway.app/calls';
+
+  const transcriptHtml = transcriptPretty
+    ? `<div style="background:#f0f9ff;padding:15px;border-radius:6px;margin:20px 0;border-left:4px solid #2563eb;">
+         <h3 style="margin-top:0;color:#1e40af;">Call Transcript</h3>
+         <pre style="white-space:pre-wrap;font-family:Arial,sans-serif;font-size:13px;color:#334155;">${transcriptPretty}</pre>
+       </div>`
+    : `<p style="color:#666;font-style:italic;">Transcript unavailable.</p>`;
+
+  const htmlContent = `
+    <div style="font-family:Arial,sans-serif;padding:20px;background:#f5f5f5;">
+      <div style="background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1);">
+        <h2 style="color:#1e3a5f;margin-top:0;">${dirLabel} Call Recording</h2>
+        <p><strong>From:</strong> ${fromNumber}</p>
+        <p><strong>Duration:</strong> ${durationSeconds}s</p>
+        <p><strong>Time:</strong> ${timestamp}</p>
+        <p style="font-size:12px;color:#64748b;">
+          Audio attached as ${filename}. View dashboard: <a href="${dashboardUrl}">${dashboardUrl}</a>
+        </p>
+        ${transcriptHtml}
+        <p style="color:#999;font-size:11px;border-top:1px solid #eee;padding-top:10px;margin-top:20px;">
+          Automated notification — All Cape Fence Phone System
+        </p>
+      </div>
+    </div>`;
+
+  const textContent = `${dirLabel} Call\nFrom: ${fromNumber}\nDuration: ${durationSeconds}s\nTime: ${timestamp}\n\n${transcriptPretty || 'No transcript available.'}`;
+
+  await sendBrevoEmail({
+    subject: `${dirLabel} Call from ${fromNumber} (${durationSeconds}s)`,
+    textContent,
+    htmlContent,
+    attachments: audioBase64 ? [{ content: audioBase64, name: filename }] : []
+  });
+}
+
+// ============================================
+// HELPER: Process voicemail (no transcription)
+// ============================================
+async function sendVoicemailEmail(recordingData) {
+  console.log('Processing voicemail...');
+  const recordingSid = recordingData.RecordingSid;
+
+  let audioBuffer = null;
+  try {
+    audioBuffer = await downloadTwilioRecording(recordingSid);
+  } catch (err) {
+    console.error('Voicemail download failed:', err.message);
+    return { success: false, error: err.message };
+  }
+
+  const r2Key = `voicemails/${new Date().toISOString().slice(0, 10)}/${recordingData.CallSid || recordingSid}.mp3`;
+  await uploadToR2(r2Key, audioBuffer);
+
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO voicemails (call_sid, recording_sid, from_number, duration_seconds, r2_key)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(recordingData.CallSid || recordingSid, recordingSid, recordingData.From,
+           parseInt(recordingData.RecordingDuration, 10) || 0, r2Key);
+  } catch (err) {
+    console.warn('DB voicemail insert:', err.message);
+  }
+
+  const timestamp   = getEstTimestamp();
+  const phoneNumber = (recordingData.From || '').replace(/[^0-9]/g, '');
+  const filename    = `voicemail-${phoneNumber}-${Date.now()}.mp3`;
+  const audioBase64 = audioBuffer.toString('base64');
+
+  return sendBrevoEmail({
+    subject: `New Voicemail from ${recordingData.From}`,
+    textContent: `Voicemail received\nFrom: ${recordingData.From}\nDuration: ${recordingData.RecordingDuration}s\n${timestamp}`,
+    htmlContent: `
+      <div style="font-family:Arial,sans-serif;padding:20px;background:#f5f5f5;">
+        <div style="background:white;padding:20px;border-radius:8px;">
+          <h2 style="color:#1e3a5f;margin-top:0;">New Voicemail</h2>
+          <p><strong>From:</strong> ${recordingData.From}</p>
+          <p><strong>Duration:</strong> ${recordingData.RecordingDuration}s</p>
+          <p><strong>Received:</strong> ${timestamp}</p>
+          <p style="font-size:12px;color:#64748b;">Audio attached as ${filename}</p>
+        </div>
+      </div>`,
+    attachments: [{ content: audioBase64, name: filename }]
+  });
+}
+
+// ============================================
+// BUSINESS HOURS CHECK
+// ============================================
+function isBusinessHours() {
   const now = new Date();
-  const est = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
-  const hour = est.getHours();
-  const day = est.getDay(); // 0 = Sunday, 1 = Monday, etc.
-  
-  const isBusinessHours = (day >= 1 && day <= 5) && (hour >= 8 && hour < 17);
-  
-  if (isBusinessHours) {
-    // Business hours: Ring both desk phones simultaneously, then mobile, then voicemail
-    response.say('Thank you for calling All Cape Fence. Please hold while we connect you.');
-    
-    // Dial both desk phones simultaneously
+  const est = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const h = est.getHours();
+  const d = est.getDay();
+  return (d >= 1 && d <= 5) && (h >= 8 && h < 17);
+}
+
+// ============================================
+// BASIC ROUTES
+// ============================================
+app.get('/', (req, res) => res.send('All Cape Fence Phone System running'));
+app.get('/health', (req, res) => res.json({ status: 'healthy', timestamp: new Date().toISOString() }));
+
+// ============================================
+// TWILIO VOICE WEBHOOKS
+// ============================================
+
+// Incoming calls
+app.post('/webhook/voice', (req, res) => {
+  console.log(`Incoming call from ${req.body.From}`);
+  const response = new twiml.VoiceResponse();
+
+  if (isBusinessHours()) {
+    response.say('Thank you for calling All Cape Fence. This call may be recorded for quality and training purposes. Please hold while we connect you.');
+
     const dial = response.dial({
       action: '/webhook/dial-status',
       method: 'POST',
       timeout: 20,
-      callerId: req.body.From // Use the Twilio number as caller ID
+      callerId: req.body.From,
+      record: 'record-from-answer-dual',
+      recordingStatusCallback: '/webhook/call-recording',
+      recordingStatusCallbackMethod: 'POST'
     });
-    
-    // Ring desk phones and office wireless via SIP
+
     dial.sip('sip:phone1@allcapefence.sip.twilio.com');
     dial.sip('sip:phone2@allcapefence.sip.twilio.com');
     dial.sip('sip:phone3@allcapefence.sip.twilio.com');
-    
-    console.log(response.toString());
-    
   } else {
-    // After hours: Straight to voicemail
-    response.say('Thank you for calling All Cape Fence. Our office hours are Monday through Friday, 8 AM to 5 PM Eastern Time. Please leave a message after the beep.');
-    
+    response.say('Thank you for calling All Cape Fence. Our office hours are Monday through Friday, 8 AM to 5 PM. Please leave a message after the beep.');
     response.record({
       action: '/webhook/recording',
       method: 'POST',
@@ -89,56 +441,47 @@ app.post('/webhook/voice', (req, res) => {
       finishOnKey: '#',
       recordingStatusCallback: '/webhook/recording-status'
     });
-    
     response.say('We did not receive a recording. Goodbye.');
   }
-  
+
   res.type('text/xml');
   res.send(response.toString());
 });
 
-// Handle dial status (when desk phones don't answer or are busy)
+// Desk phones no-answer → try mobile
 app.post('/webhook/dial-status', (req, res) => {
   console.log('Dial status:', req.body.DialCallStatus);
-  console.log('Dial duration:', req.body.DialCallDuration);
-  
   const response = new twiml.VoiceResponse();
-  
-  // If both desk phones didn't answer, try mobile phone
-  if (req.body.DialCallStatus === 'no-answer' || req.body.DialCallStatus === 'busy' || req.body.DialCallStatus === 'failed') {
-    
-    // Try mobile phone as fallback
-    response.say('Please continue to hold while we try to a team member for you.');
-    
+  const noAnswer = ['no-answer', 'busy', 'failed'].includes(req.body.DialCallStatus);
+
+  if (noAnswer) {
+    response.say('Please continue to hold while we try to reach a team member.');
     const mobileDial = response.dial({
       action: '/webhook/mobile-dial-status',
       method: 'POST',
       timeout: 15,
-      callerId: req.body.To
+      callerId: req.body.To,
+      record: 'record-from-answer-dual',
+      recordingStatusCallback: '/webhook/call-recording',
+      recordingStatusCallbackMethod: 'POST'
     });
-    
-    mobileDial.number(process.env.MOBILE_PHONE_NUMBER || '+16174139699');
-    
+    mobileDial.number(process.env.MOBILE_PHONE_NUMBER);
   } else {
-    // Call was answered by one of the desk phones, no further action needed
     response.hangup();
   }
-  
+
   res.type('text/xml');
   res.send(response.toString());
 });
 
-// Handle mobile phone dial status (final fallback to voicemail)
+// Mobile no-answer → voicemail
 app.post('/webhook/mobile-dial-status', (req, res) => {
   console.log('Mobile dial status:', req.body.DialCallStatus);
-  console.log('Mobile dial duration:', req.body.DialCallDuration);
-  
   const response = new twiml.VoiceResponse();
-  
-  // If mobile phone doesn't answer either, go to voicemail
-  if (req.body.DialCallStatus === 'no-answer' || req.body.DialCallStatus === 'busy' || req.body.DialCallStatus === 'failed') {
+  const noAnswer = ['no-answer', 'busy', 'failed'].includes(req.body.DialCallStatus);
+
+  if (noAnswer) {
     response.say('We are currently with other customers. Please leave a message after the beep.');
-    
     response.record({
       action: '/webhook/recording',
       method: 'POST',
@@ -146,871 +489,426 @@ app.post('/webhook/mobile-dial-status', (req, res) => {
       finishOnKey: '#',
       recordingStatusCallback: '/webhook/recording-status'
     });
-    
     response.say('We did not receive a recording. Goodbye.');
   } else {
-    // Mobile phone answered
     response.hangup();
   }
-  
+
   res.type('text/xml');
   res.send(response.toString());
 });
 
-// Handle outbound calls from desk phone
+// Outbound calls from desk phone
 app.post('/webhook/outbound', (req, res) => {
-  console.log('Outbound call from SIP phone:');
-  console.log('From:', req.body.From);
-  console.log('To:', req.body.To);
-  console.log('Call SID:', req.body.CallSid);
-  
+  console.log(`Outbound call from ${req.body.From} to ${req.body.To}`);
   const response = new twiml.VoiceResponse();
-  
-  // Extract the destination number (remove sip: prefix if present)
-  let destinationNumber = req.body.To;
-  if (destinationNumber.startsWith('sip:')) {
-    // Extract number from SIP URI (e.g., sip:+15551234567@... -> +15551234567)
-    destinationNumber = destinationNumber.split('@')[0].replace('sip:', '');
-  }
-  
-  // Validate the number format (should start with + for international format)
-  if (!destinationNumber.startsWith('+')) {
-    // If it's a 10-digit US number, add +1
-    if (destinationNumber.match(/^\d{10}$/)) {
-      destinationNumber = '+1' + destinationNumber;
-    } else if (destinationNumber.match(/^1\d{10}$/)) {
-      // If it starts with 1 and has 11 digits, add +
-      destinationNumber = '+' + destinationNumber;
-    } else {
-      // Invalid number format
-      response.say('The number you dialed is not valid. Please try again.');
+
+  let dest = req.body.To;
+  if (dest.startsWith('sip:')) dest = dest.split('@')[0].replace('sip:', '');
+  if (!dest.startsWith('+')) {
+    if (dest.match(/^\d{10}$/))      dest = '+1' + dest;
+    else if (dest.match(/^1\d{10}$/)) dest = '+' + dest;
+    else {
+      response.say('The number you dialed is not valid.');
       response.hangup();
       res.type('text/xml');
-      res.send(response.toString());
-      return;
+      return res.send(response.toString());
     }
   }
-  
-  console.log('Formatted destination number:', destinationNumber);
-  
-  // Dial the destination number
+
+  // Outbound calls are NOT recorded — no disclosure needed
   const dial = response.dial({
-    callerId: process.env.MAIN_PHONE_NUMBER, // Use your main Twilio number as caller ID
+    callerId: process.env.MAIN_PHONE_NUMBER,
     timeout: 30
   });
-  dial.number(destinationNumber);
-  
+  dial.number(dest);
+
   res.type('text/xml');
   res.send(response.toString());
 });
 
-// ============================================
-// IMPROVED WEBHOOK ENDPOINT
-// ============================================
+// === NEW: Call recording webhook (answered calls, both inbound + outbound) ===
+app.post('/webhook/call-recording', async (req, res) => {
+  res.sendStatus(200); // Acknowledge Twilio immediately
 
-app.post('/webhook/recording', async (req, res) => {
-  console.log('🎙️  ========== RECORDING WEBHOOK TRIGGERED ==========');
-  console.log('🎙️  [WEBHOOK] Timestamp:', new Date().toISOString());
-  console.log('🎙️  [WEBHOOK] Request headers:', req.headers);
-  
-  // Log all the data Twilio sent us
-  console.log('🎙️  [WEBHOOK] Request body:', JSON.stringify(req.body, null, 2));
-  console.log('🎙️  [WEBHOOK] Recording URL:', req.body.RecordingUrl);
-  console.log('🎙️  [WEBHOOK] Recording Duration:', req.body.RecordingDuration);
-  console.log('🎙️  [WEBHOOK] From number:', req.body.From);
-  console.log('🎙️  [WEBHOOK] To number:', req.body.To);
-  console.log('🎙️  [WEBHOOK] Call SID:', req.body.CallSid);
-  console.log('🎙️  [WEBHOOK] Recording SID:', req.body.RecordingSid);
+  const { RecordingSid, CallSid, RecordingDuration, RecordingStatus } = req.body;
 
-  // Validate we have the minimum required data
-  if (!req.body.RecordingUrl || !req.body.From) {
-    console.error('❌ [WEBHOOK] Missing required recording data!');
-    console.error('❌ [WEBHOOK] Body:', req.body);
+  if (RecordingStatus !== 'completed') {
+    console.log(`Recording ${RecordingSid} not completed yet: ${RecordingStatus}`);
+    return;
   }
 
-  // Send the email notification (AWAIT it so we can see the result)
-  console.log('🎙️  [WEBHOOK] Calling sendVoicemailEmail...');
-  const emailResult = await sendVoicemailEmail(req.body);
-  
-  if (emailResult.success) {
-    console.log('✅ [WEBHOOK] Email notification sent successfully!');
-    console.log('✅ [WEBHOOK] Message ID:', emailResult.messageId);
-  } else {
-    console.error('❌ [WEBHOOK] Email notification failed!');
-    console.error('❌ [WEBHOOK] Error:', emailResult.error);
-    console.error('❌ [WEBHOOK] Error code:', emailResult.code);
-  }
-
-  // Respond to Twilio with TwiML
-  const response = new twiml.VoiceResponse();
-  response.say('Thank you for your message. We will get back to you soon. Goodbye.');
-
-  console.log('🎙️  [WEBHOOK] Sending TwiML response back to Twilio');
-  res.type('text/xml');
-  res.send(response.toString());
-  console.log('🎙️  ========== WEBHOOK PROCESSING COMPLETE ==========\n');
-});
-
-
-async function sendVoicemailEmail(recordingData) {
-  console.log('📧 ========== EMAIL FUNCTION STARTED ==========');
-  console.log('📧 [EMAIL] Timestamp:', new Date().toISOString());
-  
-  // Log what data we received
-  console.log('📧 [EMAIL] Recording data received:', {
-    from: recordingData.From,
-    duration: recordingData.RecordingDuration,
-    url: recordingData.RecordingUrl,
-    sid: recordingData.RecordingSid,
-    hasAllData: !!(recordingData.From && recordingData.RecordingDuration && recordingData.RecordingUrl)
-  });
-
-  // Check environment variables
-  console.log('📧 [EMAIL] Environment variables check:', {
-    hasBrevoApiKey: !!process.env.BREVO_API_KEY,
-    hasBrevoSender: !!process.env.BREVO_SENDER_EMAIL,
-    hasTwilioSid: !!process.env.TWILIO_ACCOUNT_SID,
-    hasTwilioToken: !!process.env.TWILIO_AUTH_TOKEN,
-    brevoKeyLength: process.env.BREVO_API_KEY?.length,
-    brevoSender: process.env.BREVO_SENDER_EMAIL
-  });
+  // Fetch call metadata from Twilio
+  let fromNumber = req.body.From || 'Unknown';
+  let toNumber   = req.body.To   || process.env.MAIN_PHONE_NUMBER;
+  let direction  = 'inbound';
 
   try {
-    // Validate environment variables
-    if (!process.env.BREVO_API_KEY) {
-      throw new Error('BREVO_API_KEY environment variable is not set');
-    }
-    if (!process.env.BREVO_SENDER_EMAIL) {
-      throw new Error('BREVO_SENDER_EMAIL environment variable is not set');
-    }
-    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
-      throw new Error('Twilio credentials not set');
-    }
-
-    console.log('📧 [EMAIL] Preparing to download recording from Twilio...');
-    
-    // Get the recording SID from the data
-    const recordingSid = recordingData.RecordingSid;
-    console.log('📧 [EMAIL] Recording SID:', recordingSid);
-
-    // Build the MP3 URL
-    const recordingMp3Url = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Recordings/${recordingSid}.mp3`;
-    console.log('📧 [EMAIL] MP3 URL:', recordingMp3Url);
-
-    // Create Basic Auth header
-    const authHeader = 'Basic ' + Buffer.from(
-      `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
-    ).toString('base64');
-
-    // Wait for recording to be ready, with retries
-    let audioBuffer = null;
-    let attempts = 0;
-    const maxAttempts = 5;
-    const delayMs = 2000; // 2 seconds between attempts
-
-    console.log('📧 [EMAIL] Waiting for recording to be ready (this may take a few seconds)...');
-    
-    while (attempts < maxAttempts && !audioBuffer) {
-      attempts++;
-      console.log(`📧 [EMAIL] Download attempt ${attempts}/${maxAttempts}...`);
-      
-      // Wait before attempting (except first attempt)
-      if (attempts > 1) {
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-
-      const audioResponse = await fetch(recordingMp3Url, {
-        method: 'GET',
-        headers: {
-          'Authorization': authHeader
-        }
-      });
-
-      console.log(`📧 [EMAIL] Attempt ${attempts} - Status:`, audioResponse.status);
-      console.log(`📧 [EMAIL] Attempt ${attempts} - Content-Type:`, audioResponse.headers.get('content-type'));
-
-      // Check if we got audio (not XML error)
-      const contentType = audioResponse.headers.get('content-type');
-      
-      if (audioResponse.ok && contentType && contentType.includes('audio')) {
-        // Success! We got the audio file
-        audioBuffer = await audioResponse.arrayBuffer();
-        console.log('✅ [EMAIL] Recording downloaded successfully!');
-        break;
-      } else if (audioResponse.ok && contentType && contentType.includes('xml')) {
-        // Got XML response - recording not ready yet
-        console.log(`⏳ [EMAIL] Attempt ${attempts} - Recording not ready yet (got XML response)`);
-        if (attempts < maxAttempts) {
-          console.log(`⏳ [EMAIL] Waiting ${delayMs/1000} seconds before retry...`);
-        }
-      } else {
-        // Other error
-        console.warn(`⚠️ [EMAIL] Attempt ${attempts} - Status ${audioResponse.status}`);
-        if (attempts < maxAttempts) {
-          console.log(`⏳ [EMAIL] Waiting ${delayMs/1000} seconds before retry...`);
-        }
-      }
-    }
-
-    if (!audioBuffer) {
-      throw new Error(`Failed to download recording after ${maxAttempts} attempts. Recording may not be ready yet.`);
-    }
-
-    const audioBase64 = Buffer.from(audioBuffer).toString('base64');
-    
-    console.log('📧 [EMAIL] Audio file processed:', {
-      size: audioBuffer.byteLength,
-      sizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB',
-      attempts: attempts
-    });
-
-    console.log('📧 [EMAIL] Creating Brevo email message with attachment...');
-    
-    // Format phone number for filename
-    const phoneNumber = recordingData.From.replace(/[^0-9]/g, '');
-    
-    // Get current time in EST - FIXED VERSION
-    const now = new Date();
-    
-    // Log for debugging
-    console.log('📧 [EMAIL] Current UTC time:', now.toISOString());
-    
-    // Format in EST timezone - this is the correct way
-    const estTimeFormatted = now.toLocaleString("en-US", {
-      timeZone: "America/New_York",
-      weekday: 'short',
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true
-    }) + ' EST';
-    
-    console.log('📧 [EMAIL] Formatted EST time:', estTimeFormatted);
-    
-    // Timestamp for filename (use UTC ISO format then convert)
-    const timestamp = now.toISOString().replace(/[:.]/g, '-').split('.')[0].replace('T', '-');
-    const filename = `voicemail-${phoneNumber}-${timestamp}.mp3`;
-
-    const emailData = {
-      sender: {
-        name: "All Cape Fence Voicemail",
-        email: process.env.BREVO_SENDER_EMAIL
-      },
-      to: [
-        {
-          email: "bdowdall@allcapefence.com",
-          name: "Brendan Dowdall"
-        },
-        {
-          email: "rmastrianna@allcapefence.com",
-          name: "Robert Mastrianna"
-        },
-        {
-          email: "pcollura@allcapefence.com",
-          name: "Pete Collura"
-        }
-      ],
-      subject: `📞 New Voicemail from ${recordingData.From}`,
-      textContent: `
-New voicemail received!
-
-From: ${recordingData.From}
-Duration: ${recordingData.RecordingDuration} seconds
-Received: ${estTimeFormatted}
-
-The voicemail audio file is attached to this email.
-
----
-This is an automated notification from your Twilio voicemail system.
-      `,
-      htmlContent: `
-        <div style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
-          <div style="background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-            <h2 style="color: #2563eb; margin-top: 0;">📞 New Voicemail Received</h2>
-            <p><strong>From:</strong> ${recordingData.From}</p>
-            <p><strong>Duration:</strong> ${recordingData.RecordingDuration} seconds</p>
-            <p><strong>Received:</strong> ${estTimeFormatted}</p>
-            <div style="background: #f0f9ff; padding: 15px; border-radius: 6px; margin: 20px 0; border-left: 4px solid #2563eb;">
-              <p style="margin: 0; color: #1e40af;">
-                🎧 <strong>The voicemail audio file is attached to this email.</strong>
-              </p>
-              <p style="margin: 5px 0 0 0; font-size: 12px; color: #64748b;">
-                Filename: ${filename}
-              </p>
-            </div>
-            <p style="color: #666; font-size: 12px; margin-top: 30px; border-top: 1px solid #ddd; padding-top: 10px;">
-              This is an automated notification from your Twilio voicemail system.
-            </p>
-          </div>
-        </div>
-      `,
-      attachment: [
-        {
-          content: audioBase64,
-          name: filename
-        }
-      ]
-    };
-
-    console.log('📧 [EMAIL] Prepared email:', {
-      from: emailData.sender.email,
-      to: emailData.to.map(t => t.email),
-      subject: emailData.subject,
-      attachmentName: filename,
-      attachmentSizeKB: (audioBuffer.byteLength / 1024).toFixed(2) + ' KB',
-      receivedTime: estTimeFormatted
-    });
-
-    // Send the email via Brevo API
-    console.log('📧 [EMAIL] Sending email with attachment via Brevo...');
-    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-      method: 'POST',
-      headers: {
-        'accept': 'application/json',
-        'api-key': process.env.BREVO_API_KEY,
-        'content-type': 'application/json'
-      },
-      body: JSON.stringify(emailData)
-    });
-
-    const responseData = await response.json();
-    
-    if (response.ok) {
-      console.log('✅ ========== EMAIL SENT SUCCESSFULLY ==========');
-      console.log('✅ [EMAIL] Brevo response status:', response.status);
-      console.log('✅ [EMAIL] Brevo message ID:', responseData.messageId);
-      console.log('✅ [EMAIL] Sent to:', emailData.to.map(t => t.email).join(', '));
-      console.log('✅ [EMAIL] Attachment included:', filename);
-      console.log('✅ [EMAIL] Total attempts needed:', attempts);
-      
-      return { 
-        success: true, 
-        statusCode: response.status,
-        messageId: responseData.messageId,
-        attachmentSize: audioBuffer.byteLength,
-        attempts: attempts
-      };
-    } else {
-      throw new Error(`Brevo API error: ${responseData.message || 'Unknown error'}`);
-    }
-
-  } catch (error) {
-    console.error('❌ ========== EMAIL FAILED ==========');
-    console.error('❌ [EMAIL] Error type:', error.constructor.name);
-    console.error('❌ [EMAIL] Error message:', error.message);
-    console.error('❌ [EMAIL] Error code:', error.code);
-    
-    // Log the full error object
-    console.error('❌ [EMAIL] Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
-    
-    return { 
-      success: false, 
-      error: error.message,
-      code: error.code
-    };
+    const twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    const call = await twilioClient.calls(CallSid).fetch();
+    fromNumber = call.from;
+    toNumber   = call.to;
+    direction  = call.direction.startsWith('inbound') ? 'inbound' : 'outbound';
+  } catch (err) {
+    console.warn('Could not fetch Twilio call details:', err.message);
   }
-}
 
-// Handle recording status updates
+  // Run async — do not await (Twilio already got its 200)
+  processRecording({
+    callSid: CallSid,
+    recordingSid: RecordingSid,
+    fromNumber,
+    toNumber,
+    direction,
+    durationSeconds: parseInt(RecordingDuration, 10) || 0
+  }).catch(err => console.error('processRecording error:', err.message));
+});
+
+// Voicemail recording (unanswered calls)
+app.post('/webhook/recording', async (req, res) => {
+  console.log('Voicemail webhook triggered');
+  const emailResult = await sendVoicemailEmail(req.body);
+  console.log(emailResult.success ? 'Voicemail email sent' : 'Voicemail email failed:' + emailResult.error);
+
+  const response = new twiml.VoiceResponse();
+  response.say('Thank you for your message. We will get back to you soon. Goodbye.');
+  res.type('text/xml');
+  res.send(response.toString());
+});
+
 app.post('/webhook/recording-status', (req, res) => {
   console.log('Recording status update:', req.body.RecordingStatus);
-  console.log('Recording SID:', req.body.RecordingSid);
   res.sendStatus(200);
 });
 
-// Test endpoint to simulate business hours
-app.get('/test-hours', (req, res) => {
-  const now = new Date();
-  const est = new Date(now.toLocaleString("en-US", {timeZone: "America/New_York"}));
-  const hour = est.getHours();
-  const day = est.getDay();
-  
-  const isBusinessHours = (day >= 1 && day <= 5) && (hour >= 8 && hour < 17);
-  
-  res.json({
-    currentTime: est.toLocaleString(),
-    hour: hour,
-    day: day,
-    dayName: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day],
-    isBusinessHours: isBusinessHours,
-    mobileNumber: process.env.MOBILE_PHONE_NUMBER || 'Not set'
-  });
-});
+// ============================================
+// DASHBOARD HELPERS
+// ============================================
+function dashboardShell(activeTab, body) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ACF Phone System</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f1f5f9;color:#1e293b;min-height:100vh}
+    header{background:#1e3a5f;color:white;padding:14px 24px;display:flex;align-items:center;gap:12px}
+    header h1{font-size:1.1rem;font-weight:700}
+    header span{font-size:0.8rem;opacity:.65}
+    nav{background:#0f2644;display:flex;padding:0 20px;gap:2px}
+    nav a{padding:10px 16px;color:#94a3b8;text-decoration:none;font-size:.8rem;font-weight:500;border-bottom:3px solid transparent;transition:.15s}
+    nav a:hover{color:#fff}
+    nav a.on{color:#fff;border-bottom-color:#3b82f6}
+    main{max-width:1280px;margin:0 auto;padding:24px 20px}
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:22px}
+    .stat{background:white;border-radius:8px;padding:18px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+    .stat-val{font-size:1.8rem;font-weight:700;color:#1e3a5f}
+    .stat-lbl{font-size:.75rem;color:#64748b;margin-top:3px}
+    .card{background:white;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08);overflow:hidden;margin-bottom:20px}
+    .card-hd{padding:14px 18px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between}
+    .card-hd h2{font-size:.95rem;font-weight:600}
+    .filters{padding:12px 18px;border-bottom:1px solid #e2e8f0;display:flex;gap:8px;flex-wrap:wrap}
+    .filters input,.filters select{padding:7px 11px;border:1px solid #cbd5e1;border-radius:6px;font-size:.83rem;background:white}
+    .filters input{flex:1;min-width:180px}
+    .filters button{padding:7px 16px;background:#1e3a5f;color:white;border:none;border-radius:6px;cursor:pointer;font-size:.83rem}
+    .filters a{padding:7px 12px;color:#64748b;text-decoration:none;font-size:.83rem}
+    table{width:100%;border-collapse:collapse}
+    th{text-align:left;padding:9px 14px;font-size:.72rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:#64748b;background:#f8fafc;border-bottom:1px solid #e2e8f0;white-space:nowrap}
+    td{padding:11px 14px;border-bottom:1px solid #f1f5f9;font-size:.83rem;vertical-align:top}
+    tr:last-child td{border-bottom:none}
+    tr:hover td{background:#fafbfc}
+    .badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:.68rem;font-weight:600;white-space:nowrap}
+    .bg{background:#dcfce7;color:#15803d}
+    .bb{background:#dbeafe;color:#1d4ed8}
+    .by{background:#fef9c3;color:#854d0e}
+    .br{background:#fee2e2;color:#b91c1c}
+    .bk{background:#f1f5f9;color:#475569}
+    audio{width:220px;height:32px;display:block;margin-top:4px}
+    details summary{cursor:pointer;color:#3b82f6;font-size:.78rem;user-select:none}
+    .tx{max-height:180px;overflow-y:auto;background:#f8fafc;border:1px solid #e2e8f0;border-radius:5px;padding:9px 11px;font-size:.75rem;line-height:1.65;white-space:pre-wrap;font-family:monospace;margin-top:6px}
+    .empty{text-align:center;color:#94a3b8;padding:48px;font-size:.9rem}
+    .mono{font-family:monospace}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>All Cape Fence &mdash; Phone System</h1>
+      <span>Call Recordings &amp; Voicemail Dashboard</span>
+    </div>
+  </header>
+  <nav>
+    <a href="/calls"      class="${activeTab==='calls'?'on':''}">&#128222; Call Recordings</a>
+    <a href="/voicemails" class="${activeTab==='vmail'?'on':''}">&#128236; Voicemails</a>
+    <a href="/test-hours" class="${activeTab==='hours'?'on':''}">&#128336; Business Hours</a>
+    <a href="/debug-env"  class="${activeTab==='debug'?'on':''}">&#128295; Debug</a>
+    <a href="/diagnose"   class="${activeTab==='diag'?'on':''}">&#128269; Diagnose</a>
+  </nav>
+  <main>${body}</main>
+</body>
+</html>`;
+}
 
-// Debug endpoint to check environment variables
-app.get('/debug-env', (req, res) => {
-  res.json({
-    hasTwilioSid: !!process.env.TWILIO_ACCOUNT_SID,
-    hasAuthToken: !!process.env.TWILIO_AUTH_TOKEN,
-    sidPrefix: process.env.TWILIO_ACCOUNT_SID ? process.env.TWILIO_ACCOUNT_SID.substring(0, 5) + '...' : 'undefined',
-    nodeEnv: process.env.NODE_ENV || 'undefined',
-    mainPhone: process.env.MAIN_PHONE_NUMBER || 'undefined',
-    secondaryPhone: process.env.SECONDARY_PHONE_NUMBER || 'undefined',
-    sipDomain: process.env.SIP_DOMAIN || 'undefined',
-    mobilePhone: process.env.MOBILE_PHONE_NUMBER || 'undefined',
-    hasGmailUser: !!process.env.GMAIL_USER,
-    hasGmailPassword: !!process.env.GMAIL_APP_PASSWORD,
-    hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL
-  });
-});
+function badge(status) {
+  const m = {
+    complete:   ['bg','&#10003; Complete'],
+    stored:     ['bb','&#9729; Stored'],
+    processing: ['by','&#8987; Processing'],
+    pending:    ['by','&#8987; Pending'],
+    failed:     ['br','&#10007; Failed'],
+    inbound:    ['bb','&#8601; Inbound'],
+    outbound:   ['bk','&#8599; Outbound'],
+  };
+  const [cls, lbl] = m[status] || ['bk', status || '&mdash;'];
+  return `<span class="badge ${cls}">${lbl}</span>`;
+}
 
-// Voicemail dashboard
-app.get('/voicemails', async (req, res) => {
-  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
-    return res.status(500).send(`Twilio credentials not configured. 
-    TWILIO_ACCOUNT_SID exists: ${!!process.env.TWILIO_ACCOUNT_SID}
-    TWILIO_AUTH_TOKEN exists: ${!!process.env.TWILIO_AUTH_TOKEN}
-    Check /debug-env for more details.`);
+// ============================================
+// CALLS DASHBOARD
+// ============================================
+app.get('/calls', async (req, res) => {
+  const { search, direction } = req.query;
+
+  let sql = 'SELECT * FROM calls';
+  const params = [];
+  const where = [];
+
+  if (search) {
+    where.push('(transcript_raw LIKE ? OR from_number LIKE ? OR to_number LIKE ?)');
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
   }
+  if (direction && direction !== 'all') {
+    where.push('direction = ?');
+    params.push(direction);
+  }
+  if (where.length) sql += ' WHERE ' + where.join(' AND ');
+  sql += ' ORDER BY created_at DESC LIMIT 100';
 
-  try {
-    const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    
-    // Get recordings from the last 30 days
-    const recordings = await client.recordings.list({
-      limit: 50,
-      dateCreatedAfter: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+  const calls = db.prepare(sql).all(...params);
+
+  const stats = db.prepare(`
+    SELECT
+      COUNT(*) total,
+      SUM(CASE WHEN direction='inbound'  THEN 1 ELSE 0 END) inbound,
+      SUM(CASE WHEN direction='outbound' THEN 1 ELSE 0 END) outbound,
+      SUM(CASE WHEN transcript_status='complete' THEN 1 ELSE 0 END) transcribed,
+      SUM(CASE WHEN DATE(created_at)=DATE('now') THEN 1 ELSE 0 END) today
+    FROM calls
+  `).get();
+
+  const rows = await Promise.all(calls.map(async call => {
+    let audioUrl = null;
+    if (call.r2_key) {
+      try { audioUrl = await getR2SignedUrl(call.r2_key, 7200); } catch(e) {}
+    }
+
+    const dt = new Date(call.created_at).toLocaleString('en-US', {
+      timeZone: 'America/New_York', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', hour12: true
     });
 
-    let html = `
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Voicemails - Business Phone System</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 20px; }
-            .voicemail { border: 1px solid #ccc; margin: 10px 0; padding: 15px; border-radius: 5px; }
-            .date { color: #666; font-size: 0.9em; }
-            .duration { font-weight: bold; color: #333; }
-            audio { width: 100%; margin: 10px 0; }
-            .no-recordings { text-align: center; color: #666; padding: 40px; }
-        </style>
-    </head>
-    <body>
-        <h1>📞 Business Voicemails</h1>
-        <p>Total recordings: ${recordings.length}</p>
-    `;
+    const audio = audioUrl
+      ? `<audio controls preload="none"><source src="${audioUrl}" type="audio/mpeg"></audio>`
+      : `<span style="color:#94a3b8;font-size:.75rem">Not stored</span>`;
 
-    if (recordings.length === 0) {
-      html += '<div class="no-recordings">No voicemails found in the last 30 days.</div>';
-    } else {
-      recordings.forEach((recording, index) => {
-        const recordingUrl = `https://api.twilio.com${recording.uri.replace('.json', '.mp3')}`;
-        const authenticatedUrl = recordingUrl.replace('https://', `https://${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}@`);
-        
-        // Convert to EST timezone
-        const estDate = new Date(recording.dateCreated).toLocaleString("en-US", {
-          timeZone: "America/New_York",
-          weekday: 'short',
-          year: 'numeric',
-          month: 'short',
-          day: 'numeric',
-          hour: 'numeric',
-          minute: '2-digit',
-          hour12: true
-        });
-        
-        html += `
-          <div class="voicemail">
-            <div class="date">📅 ${estDate} EST</div>
-            <div class="duration">⏱️ Duration: ${recording.duration} seconds</div>
-            <div>📞 Call SID: ${recording.callSid}</div>
-            <audio controls>
-              <source src="${authenticatedUrl}" type="audio/mpeg">
-              Your browser does not support the audio element.
-            </audio>
-            <div><a href="${authenticatedUrl}" target="_blank">Download Recording</a></div>
-          </div>
-        `;
-      });
-    }
+    const tx = call.transcript_pretty
+      ? `<details><summary>View transcript</summary><div class="tx">${call.transcript_pretty.replace(/</g,'&lt;')}</div></details>`
+      : badge(call.transcript_status);
 
-    html += `
-        <hr>
-        <p><a href="/">← Back to Home</a> | <a href="/test-hours">Test Business Hours</a></p>
-    </body>
-    </html>`;
+    return `<tr>
+      <td>${dt}</td>
+      <td class="mono" style="font-size:.78rem">${call.from_number || '&mdash;'}</td>
+      <td>${badge(call.direction)}</td>
+      <td>${call.duration_seconds ? call.duration_seconds+'s' : '&mdash;'}</td>
+      <td>${audio}</td>
+      <td style="min-width:200px">${tx}</td>
+      <td>${badge(call.recording_status)}</td>
+    </tr>`;
+  }));
 
-    res.send(html);
-  } catch (error) {
-    console.error('Error fetching recordings:', error);
-    res.status(500).send(`Error fetching voicemails: ${error.message}`);
-  }
-});
+  const body = `
+    <div class="stats">
+      <div class="stat"><div class="stat-val">${stats.today}</div><div class="stat-lbl">Calls Today</div></div>
+      <div class="stat"><div class="stat-val">${stats.total}</div><div class="stat-lbl">Total Recorded</div></div>
+      <div class="stat"><div class="stat-val">${stats.inbound}</div><div class="stat-lbl">Inbound</div></div>
+      <div class="stat"><div class="stat-val">${stats.outbound}</div><div class="stat-lbl">Outbound</div></div>
+      <div class="stat"><div class="stat-val">${stats.transcribed}</div><div class="stat-lbl">Transcribed</div></div>
+    </div>
 
-// Call analytics dashboard
-app.get('/analytics', (req, res) => {
-  // This will show which numbers get the most calls
-  // For now, we'll parse the logs, but later we can use a database
-  
-  let html = `
-  <!DOCTYPE html>
-  <html>
-  <head>
-      <title>Call Analytics - All Cape Fence</title>
-      <style>
-          body { font-family: Arial, sans-serif; margin: 20px; }
-          .metric { border: 1px solid #ccc; margin: 10px 0; padding: 15px; border-radius: 5px; }
-          .number { font-weight: bold; color: #2196F3; }
-          table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-          th { background-color: #f2f2f2; }
-      </style>
-  </head>
-  <body>
-      <h1>📊 Call Analytics - All Cape Fence</h1>
-      
-      <div class="metric">
-          <h3>📞 Number Usage Tracking</h3>
-          <p>Use this data to determine which forwarded numbers are worth keeping.</p>
-          
-          <table>
-              <tr>
-                  <th>Phone Number</th>
-                  <th>Type</th>
-                  <th>Calls This Week</th>
-                  <th>Total Calls</th>
-                  <th>Recommendation</th>
-              </tr>
-              <tr>
-                  <td class="number">${process.env.MAIN_PHONE_NUMBER || 'Main Number'}</td>
-                  <td>Primary Line</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>Keep (Primary)</td>
-              </tr>
-              <tr>
-                  <td class="number">${process.env.SECONDARY_PHONE_NUMBER || 'Secondary Number'}</td>
-                  <td>Secondary Line</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>Keep (Secondary)</td>
-              </tr>
-              <tr>
-                  <td class="number">Forwarded Number 1</td>
-                  <td>Forwarded</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>Monitor</td>
-              </tr>
-              <tr>
-                  <td class="number">Forwarded Number 2</td>
-                  <td>Forwarded</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>Monitor</td>
-              </tr>
-              <tr>
-                  <td class="number">Forwarded Number 3</td>
-                  <td>Forwarded</td>
-                  <td>-</td>
-                  <td>-</td>
-                  <td>Monitor</td>
-              </tr>
-          </table>
-          
-          <p><strong>Note:</strong> Call tracking data will populate once the system is live. 
-          Numbers with &lt;5 calls per month may be candidates for discontinuation.</p>
-      </div>
-      
-      <hr>
-      <p><a href="/">← Back to Home</a> | <a href="/voicemails">View Voicemails</a></p>
-  </body>
-  </html>`;
-
-  res.send(html);
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Webhook URL: https://twilio-business-phone-production.up.railway.app/webhook/voice`);
-  console.log(`Mobile forwarding to: ${process.env.MOBILE_PHONE_NUMBER || 'NOT SET'}`);
-});
-
-// ============================================
-// DIAGNOSTIC ENDPOINTS (For troubleshooting)
-// ============================================
-
-// Test email functionality without making a phone call
-// Updated diagnostic endpoints for Brevo
-// Replace your existing /test-email and /diagnose endpoints with these
-
-// Test email functionality without making a phone call
-app.get('/test-email', async (req, res) => {
-  console.log('🧪 [TEST] Test email endpoint called');
-  
-  try {
-    const testData = {
-      From: '+15555551234',
-      RecordingDuration: '42',
-      RecordingUrl: 'https://api.twilio.com/2010-04-01/Accounts/ACXXXXXXXX/Recordings/REXXXXXXXX'
-    };
-    
-    console.log('🧪 [TEST] Sending test email with fake data...');
-    const result = await sendVoicemailEmail(testData);
-    
-    if (result.success) {
-      res.send(`
-        <html>
-          <head><title>Email Test Result</title></head>
-          <body style="font-family: Arial, sans-serif; padding: 40px;">
-            <h1 style="color: green;">✅ Test Email Sent Successfully via Brevo!</h1>
-            <p><strong>Status Code:</strong> ${result.statusCode}</p>
-            <p><strong>Message ID:</strong> ${result.messageId}</p>
-            <p>Check your inbox at: <strong>${process.env.NOTIFICATION_EMAIL || process.env.BREVO_SENDER_EMAIL}</strong></p>
-            <p style="margin-top: 30px; color: #666;">
-              If you don't see the email within 2 minutes:
-              <ul>
-                <li>Check your spam folder</li>
-                <li>Verify the email address in your Railway environment variables</li>
-                <li>Check Railway logs for more details</li>
-                <li>Verify your Brevo API key is active</li>
-              </ul>
-            </p>
-            <p><a href="/diagnose">Run Full Diagnostics</a></p>
-          </body>
-        </html>
-      `);
-    } else {
-      res.status(500).send(`
-        <html>
-          <head><title>Email Test Failed</title></head>
-          <body style="font-family: Arial, sans-serif; padding: 40px;">
-            <h1 style="color: red;">❌ Test Email Failed</h1>
-            <p><strong>Error:</strong> ${result.error}</p>
-            <p><strong>Error Code:</strong> ${result.code || 'N/A'}</p>
-            <p style="margin-top: 30px;">
-              <strong>Check Railway logs for detailed error information.</strong>
-            </p>
-            <p><a href="/diagnose">Run Full Diagnostics</a></p>
-          </body>
-        </html>
-      `);
-    }
-  } catch (error) {
-    console.error('🧪 [TEST] Test endpoint error:', error);
-    res.status(500).send(`
-      <html>
-        <head><title>Email Test Error</title></head>
-        <body style="font-family: Arial, sans-serif; padding: 40px;">
-          <h1 style="color: red;">❌ Test Failed with Exception</h1>
-          <p><strong>Error:</strong> ${error.message}</p>
-          <pre style="background: #f5f5f5; padding: 15px; border-radius: 4px;">${error.stack}</pre>
-          <p><a href="/diagnose">Run Full Diagnostics</a></p>
-        </body>
-      </html>
-    `);
-  }
-});
-
-// Comprehensive diagnostic endpoint for Brevo
-app.get('/diagnose', async (req, res) => {
-  console.log('🔍 [DIAGNOSE] Running comprehensive diagnostics...');
-  
-  const diagnosis = {
-    timestamp: new Date().toISOString(),
-    environment: {
-      nodeVersion: process.version,
-      platform: process.platform,
-      hasBrevoApiKey: !!process.env.BREVO_API_KEY,
-      hasBrevoSender: !!process.env.BREVO_SENDER_EMAIL,
-      hasNotificationEmail: !!process.env.NOTIFICATION_EMAIL,
-      brevoKeyLength: process.env.BREVO_API_KEY?.length || 0,
-      brevoKeyPrefix: process.env.BREVO_API_KEY?.substring(0, 15) || 'NOT SET',
-      brevoSender: process.env.BREVO_SENDER_EMAIL || 'NOT SET',
-      notificationEmail: process.env.NOTIFICATION_EMAIL || 'NOT SET (will use BREVO_SENDER_EMAIL)'
-    },
-    tests: {}
-  };
-
-  // Test 1: Environment variables
-  diagnosis.tests.environmentVariables = {
-    status: (process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL) ? 'PASS' : 'FAIL',
-    details: !process.env.BREVO_API_KEY ? 'BREVO_API_KEY is missing' : 
-             !process.env.BREVO_SENDER_EMAIL ? 'BREVO_SENDER_EMAIL is missing' : 
-             'All required variables present'
-  };
-
-  // Test 2: Brevo API key format
-  if (process.env.BREVO_API_KEY) {
-    const isValidFormat = process.env.BREVO_API_KEY.startsWith('xkeysib-');
-    diagnosis.tests.apiKeyFormat = {
-      status: isValidFormat ? 'PASS' : 'FAIL',
-      details: isValidFormat ? 'API key has correct xkeysib- prefix' : 'API key should start with "xkeysib-"'
-    };
-  } else {
-    diagnosis.tests.apiKeyFormat = {
-      status: 'SKIPPED',
-      details: 'No API key to validate'
-    };
-  }
-
-  // Test 3: Test Brevo API connection
-  if (process.env.BREVO_API_KEY) {
-    try {
-      const response = await fetch('https://api.brevo.com/v3/account', {
-        method: 'GET',
-        headers: {
-          'accept': 'application/json',
-          'api-key': process.env.BREVO_API_KEY
-        }
-      });
-      
-      if (response.ok) {
-        const accountData = await response.json();
-        diagnosis.tests.brevoConnection = {
-          status: 'PASS',
-          details: `Connected to Brevo account: ${accountData.email || 'Unknown'}`,
-          accountInfo: accountData.email
-        };
-      } else {
-        diagnosis.tests.brevoConnection = {
-          status: 'FAIL',
-          details: `API returned status ${response.status}`,
-          hint: response.status === 401 ? 'Invalid API key' : 'API connection failed'
-        };
-      }
-    } catch (error) {
-      diagnosis.tests.brevoConnection = {
-        status: 'FAIL',
-        details: error.message
-      };
-    }
-  } else {
-    diagnosis.tests.brevoConnection = {
-      status: 'SKIPPED',
-      details: 'No API key configured'
-    };
-  }
-
-  // Test 4: Attempt to send test email
-  try {
-    const testData = {
-      From: '+15555559999',
-      RecordingDuration: '15',
-      RecordingUrl: 'https://api.twilio.com/test-recording-url'
-    };
-    const emailResult = await sendVoicemailEmail(testData);
-    diagnosis.tests.sendTestEmail = {
-      status: emailResult.success ? 'PASS' : 'FAIL',
-      details: emailResult.success ? 
-        `Email sent! Status code: ${emailResult.statusCode}, Message ID: ${emailResult.messageId}` : 
-        emailResult.error,
-      messageId: emailResult.messageId
-    };
-  } catch (error) {
-    diagnosis.tests.sendTestEmail = {
-      status: 'FAIL',
-      details: error.message
-    };
-  }
-
-  // Generate HTML response
-  const passCount = Object.values(diagnosis.tests).filter(t => t.status === 'PASS').length;
-  const failCount = Object.values(diagnosis.tests).filter(t => t.status === 'FAIL').length;
-  
-  const htmlResponse = `
-    <html>
-      <head>
-        <title>Twilio Email Diagnostics (Brevo)</title>
-        <style>
-          body { font-family: Arial, sans-serif; padding: 40px; background: #f5f5f5; }
-          .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-          h1 { color: #333; border-bottom: 3px solid #2563eb; padding-bottom: 10px; }
-          .summary { display: flex; gap: 20px; margin: 20px 0; }
-          .summary-card { flex: 1; padding: 15px; border-radius: 6px; text-align: center; }
-          .summary-card.pass { background: #dcfce7; border: 2px solid #16a34a; }
-          .summary-card.fail { background: #fee2e2; border: 2px solid #dc2626; }
-          .test-result { margin: 15px 0; padding: 15px; border-radius: 6px; border-left: 4px solid #ddd; }
-          .test-result.pass { background: #f0fdf4; border-left-color: #16a34a; }
-          .test-result.fail { background: #fef2f2; border-left-color: #dc2626; }
-          .test-result.skipped { background: #fef9e5; border-left-color: #f59e0b; }
-          .status { font-weight: bold; font-size: 18px; }
-          .status.pass { color: #16a34a; }
-          .status.fail { color: #dc2626; }
-          .status.skipped { color: #f59e0b; }
-          pre { background: #f5f5f5; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
-          .hint { background: #fff4d5; padding: 10px; border-radius: 4px; margin-top: 10px; border-left: 4px solid #f59e0b; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h1>🔍 Twilio Voicemail Email Diagnostics (Brevo)</h1>
-          <p><strong>Timestamp:</strong> ${diagnosis.timestamp}</p>
-          
-          <div class="summary">
-            <div class="summary-card pass">
-              <h2>${passCount}</h2>
-              <p>Tests Passed</p>
-            </div>
-            <div class="summary-card fail">
-              <h2>${failCount}</h2>
-              <p>Tests Failed</p>
-            </div>
-          </div>
-
-          <h2>Environment Variables</h2>
-          <pre>${JSON.stringify(diagnosis.environment, null, 2)}</pre>
-
-          <h2>Test Results</h2>
-          ${Object.entries(diagnosis.tests).map(([testName, result]) => `
-            <div class="test-result ${result.status.toLowerCase()}">
-              <div class="status ${result.status.toLowerCase()}">
-                ${result.status === 'PASS' ? '✅' : result.status === 'FAIL' ? '❌' : '⚠️'} 
-                ${testName.replace(/([A-Z])/g, ' $1').trim()}
-              </div>
-              <p><strong>Details:</strong> ${result.details}</p>
-              ${result.accountInfo ? `<p><strong>Account:</strong> ${result.accountInfo}</p>` : ''}
-              ${result.messageId ? `<p><strong>Message ID:</strong> ${result.messageId}</p>` : ''}
-              ${result.hint ? `<div class="hint">💡 <strong>Hint:</strong> ${result.hint}</div>` : ''}
-            </div>
-          `).join('')}
-
-          <h2>Next Steps</h2>
-          ${failCount > 0 ? `
-            <div style="background: #fef2f2; padding: 15px; border-radius: 6px; border-left: 4px solid #dc2626;">
-              <p><strong>Issues detected!</strong> Follow these steps:</p>
-              <ol>
-                ${!process.env.BREVO_API_KEY || !process.env.BREVO_SENDER_EMAIL ? 
-                  '<li>Set missing environment variables in Railway</li>' : ''}
-                ${diagnosis.tests.apiKeyFormat?.status === 'FAIL' ? 
-                  '<li>Your API key doesn\'t start with "xkeysib-" - check your Brevo dashboard for the correct key</li>' : ''}
-                ${diagnosis.tests.brevoConnection?.status === 'FAIL' ? 
-                  '<li>Verify your API key at: <a href="https://app.brevo.com/settings/keys/api" target="_blank">Brevo API Keys</a></li>' : ''}
-              </ol>
-            </div>
-          ` : `
-            <div style="background: #f0fdf4; padding: 15px; border-radius: 6px; border-left: 4px solid #16a34a;">
-              <p><strong>✅ All tests passed!</strong> Your email system should be working.</p>
-              <p>If you're still not receiving emails:</p>
-              <ul>
-                <li>Check your spam folder</li>
-                <li>Verify Twilio webhook is configured correctly</li>
-                <li>Leave a test voicemail and check Railway logs</li>
-              </ul>
-            </div>
-          `}
-
-          <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd;">
-            <p>
-              <a href="/test-email" style="background: #2563eb; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px; margin-right: 10px;">
-                Send Test Email
-              </a>
-              <a href="/diagnose" style="background: #6b7280; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">
-                Run Diagnostics Again
-              </a>
-            </p>
-          </div>
+    <div class="card">
+      <div class="card-hd"><h2>&#128222; Call Recordings (last 100)</h2></div>
+      <form method="GET" action="/calls">
+        <div class="filters">
+          <input type="text" name="search" placeholder="Search phone number or transcript…" value="${search||''}">
+          <select name="direction">
+            <option value="all" ${!direction||direction==='all'?'selected':''}>All directions</option>
+            <option value="inbound"  ${direction==='inbound' ?'selected':''}>Inbound</option>
+            <option value="outbound" ${direction==='outbound'?'selected':''}>Outbound</option>
+          </select>
+          <button type="submit">Search</button>
+          ${search||direction?`<a href="/calls">Clear</a>`:''}
         </div>
-      </body>
-    </html>
-  `;
+      </form>
+      ${rows.length === 0
+        ? `<div class="empty">No call recordings found.</div>`
+        : `<div style="overflow-x:auto"><table>
+            <thead><tr>
+              <th>Date/Time (EST)</th><th>From</th><th>Direction</th><th>Duration</th>
+              <th>Recording</th><th>Transcript</th><th>Status</th>
+            </tr></thead>
+            <tbody>${rows.join('')}</tbody>
+           </table></div>`
+      }
+    </div>`;
 
-  console.log('🔍 [DIAGNOSE] Diagnostics complete');
-  console.log('🔍 [DIAGNOSE] Results:', JSON.stringify(diagnosis, null, 2));
-  
-  res.send(htmlResponse);
+  res.send(dashboardShell('calls', body));
+});
+
+// ============================================
+// VOICEMAILS DASHBOARD
+// ============================================
+app.get('/voicemails', async (req, res) => {
+  const voicemails = db.prepare('SELECT * FROM voicemails ORDER BY created_at DESC LIMIT 50').all();
+
+  const rows = await Promise.all(voicemails.map(async vm => {
+    let audioUrl = null;
+    if (vm.r2_key) {
+      try { audioUrl = await getR2SignedUrl(vm.r2_key, 7200); } catch(e) {}
+    }
+
+    const dt = new Date(vm.created_at).toLocaleString('en-US', {
+      timeZone: 'America/New_York', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', hour12: true
+    });
+
+    const audio = audioUrl
+      ? `<audio controls preload="none"><source src="${audioUrl}" type="audio/mpeg"></audio>`
+      : `<span style="color:#94a3b8;font-size:.75rem">Not stored</span>`;
+
+    return `<tr>
+      <td>${dt}</td>
+      <td class="mono" style="font-size:.78rem">${vm.from_number||'&mdash;'}</td>
+      <td>${vm.duration_seconds?vm.duration_seconds+'s':'&mdash;'}</td>
+      <td>${audio}</td>
+    </tr>`;
+  }));
+
+  const total = db.prepare('SELECT COUNT(*) n FROM voicemails').get().n;
+  const today = db.prepare("SELECT COUNT(*) n FROM voicemails WHERE DATE(created_at)=DATE('now')").get().n;
+
+  const body = `
+    <div class="stats">
+      <div class="stat"><div class="stat-val">${today}</div><div class="stat-lbl">Voicemails Today</div></div>
+      <div class="stat"><div class="stat-val">${total}</div><div class="stat-lbl">Total Voicemails</div></div>
+    </div>
+    <div class="card">
+      <div class="card-hd"><h2>&#128236; Voicemails (last 50)</h2></div>
+      ${rows.length===0
+        ? `<div class="empty">No voicemails found.</div>`
+        : `<div style="overflow-x:auto"><table>
+            <thead><tr><th>Date/Time (EST)</th><th>From</th><th>Duration</th><th>Playback</th></tr></thead>
+            <tbody>${rows.join('')}</tbody>
+           </table></div>`
+      }
+    </div>`;
+
+  res.send(dashboardShell('vmail', body));
+});
+
+// ============================================
+// UTILITY & DEBUG ROUTES
+// ============================================
+
+app.get('/test-hours', (req, res) => {
+  const est = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const dayNames = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const data = {
+    currentEstTime: est.toLocaleString(),
+    hour: est.getHours(),
+    day: est.getDay(),
+    dayName: dayNames[est.getDay()],
+    isBusinessHours: isBusinessHours(),
+    mobileNumber: process.env.MOBILE_PHONE_NUMBER || 'Not set'
+  };
+  res.send(dashboardShell('hours', `<div class="card" style="padding:24px"><pre style="font-size:.9rem">${JSON.stringify(data,null,2)}</pre></div>`));
+});
+
+app.get('/debug-env', (req, res) => {
+  const data = {
+    twilio:     { hasSid: !!process.env.TWILIO_ACCOUNT_SID, hasToken: !!process.env.TWILIO_AUTH_TOKEN },
+    phones:     { main: process.env.MAIN_PHONE_NUMBER, secondary: process.env.SECONDARY_PHONE_NUMBER, mobile: process.env.MOBILE_PHONE_NUMBER },
+    brevo:      { hasKey: !!process.env.BREVO_API_KEY, sender: process.env.BREVO_SENDER_EMAIL },
+    assemblyai: { hasKey: !!process.env.ASSEMBLYAI_API_KEY },
+    r2:         { hasAccount: !!process.env.CF_ACCOUNT_ID, hasAccess: !!process.env.R2_ACCESS_KEY_ID, hasSecret: !!process.env.R2_SECRET_ACCESS_KEY, bucket: process.env.R2_BUCKET_NAME },
+    db:         { calls: db.prepare('SELECT COUNT(*) n FROM calls').get().n, voicemails: db.prepare('SELECT COUNT(*) n FROM voicemails').get().n }
+  };
+  res.send(dashboardShell('debug', `<div class="card" style="padding:24px"><pre style="font-size:.85rem">${JSON.stringify(data,null,2)}</pre></div>`));
+});
+
+app.get('/test-email', async (req, res) => {
+  const result = await sendBrevoEmail({
+    subject: 'Test Email — All Cape Fence Phone System',
+    textContent: 'Test email from phone system.',
+    htmlContent: '<h2 style="color:green">Test Email OK</h2><p>Brevo integration is working.</p>'
+  });
+  res.json(result);
+});
+
+app.get('/diagnose', async (req, res) => {
+  const results = {
+    brevo: { configured: !!process.env.BREVO_API_KEY && !!process.env.BREVO_SENDER_EMAIL }
+  };
+
+  // AssemblyAI ping
+  if (process.env.ASSEMBLYAI_API_KEY) {
+    try {
+      const r = await fetch('https://api.assemblyai.com/v2/transcript?limit=1', {
+        headers: { authorization: process.env.ASSEMBLYAI_API_KEY }
+      });
+      results.assemblyai = { configured: true, status: r.status, ok: r.status !== 401 };
+    } catch (e) {
+      results.assemblyai = { configured: true, ok: false, error: e.message };
+    }
+  } else {
+    results.assemblyai = { configured: false };
+  }
+
+  // R2 write test
+  const r2 = getR2Client();
+  if (r2) {
+    try {
+      await r2.send(new PutObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: 'test/ping.txt',
+        Body: Buffer.from('ping'),
+        ContentType: 'text/plain'
+      }));
+      results.r2 = { configured: true, writable: true };
+    } catch (e) {
+      results.r2 = { configured: true, writable: false, error: e.message };
+    }
+  } else {
+    results.r2 = { configured: false };
+  }
+
+  results.db = {
+    calls: db.prepare('SELECT COUNT(*) n FROM calls').get().n,
+    voicemails: db.prepare('SELECT COUNT(*) n FROM voicemails').get().n
+  };
+
+  res.send(dashboardShell('diag', `<div class="card" style="padding:24px"><pre style="font-size:.85rem">${JSON.stringify(results,null,2)}</pre></div>`));
+});
+
+// ============================================
+// START
+// ============================================
+app.listen(PORT, () => {
+  console.log(`\nAll Cape Fence Phone System on port ${PORT}`);
+  console.log(`Webhook:    https://twilio-business-phone-production.up.railway.app/webhook/voice`);
+  console.log(`Dashboard:  https://twilio-business-phone-production.up.railway.app/calls`);
+  console.log(`Voicemails: https://twilio-business-phone-production.up.railway.app/voicemails`);
+  console.log(`R2 bucket:  ${process.env.R2_BUCKET_NAME || 'NOT CONFIGURED'}`);
+  console.log(`AssemblyAI: ${process.env.ASSEMBLYAI_API_KEY ? 'configured' : 'NOT CONFIGURED'}\n`);
 });
